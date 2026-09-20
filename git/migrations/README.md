@@ -1,0 +1,1 @@
+As tabelas são criadas automaticamente pelo SQLAlchemy em banco novo. Este diretório reserva migrations versionadas para mudanças futuras. Antes de alterar um banco de produção, faça backup/snapshot do PostgreSQL.
