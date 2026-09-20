@@ -1,7 +1,9 @@
 import os
+import hmac
+import hashlib
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Header, HTTPException, Body
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, Header, HTTPException, Body, Request
+from fastapi.responses import HTMLResponse, Response, RedirectResponse, JSONResponse
 from sqlalchemy import select, func
 from clutch_bot.db import init_db, Session
 from clutch_bot.models import Skin, Buylist, Sale, Order, Feedback, Audit, Operation, Negotiation, NegotiationOrder, TradeInItem, NegotiationPayment, Ledger
@@ -11,6 +13,21 @@ from clutch_os.core.engine import wallet, analyze_purchase
 app=FastAPI(title='Clutch OS API',version='3.7.5')
 
 CANONICAL_GUILD_ID=int(os.getenv('GUILD_ID','1549553223470416022') or 1549553223470416022)
+
+SESSION_COOKIE='clutch_admin_session'
+
+def _admin_key():
+    return (os.getenv('ADMIN_API_KEY') or '').strip()
+
+def _session_value():
+    key=_admin_key()
+    if not key: return ''
+    return hmac.new(key.encode('utf-8'),b'clutch-control-session-v1',hashlib.sha256).hexdigest()
+
+def _session_ok(request:Request):
+    expected=_session_value()
+    supplied=request.cookies.get(SESSION_COOKIE,'')
+    return bool(expected and supplied and hmac.compare_digest(supplied,expected))
 
 @app.middleware('http')
 async def canonical_guild_lock(request, call_next):
@@ -31,6 +48,12 @@ async def canonical_guild_lock(request, call_next):
                 request.scope['path']=canonical
                 request.scope['raw_path']=canonical.encode('ascii')
                 print(f'[IDENTITY] CANONICALIZADO cliente legado: {requested} -> {CANONICAL_GUILD_ID} | {original}')
+    # Sessao web HttpOnly: a ADMIN_API_KEY nunca fica no JavaScript/URL.
+    if path.startswith('/api/v1/') and path not in exempt and _session_ok(request):
+        headers=list(request.scope.get('headers',[]))
+        if not any(k.lower()==b'x-admin-key' for k,v in headers):
+            headers.append((b'x-admin-key',_admin_key().encode('utf-8')))
+            request.scope['headers']=headers
     response=await call_next(request)
     if path=='/' or path.startswith('/api/v1/identity'):
         response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
@@ -39,7 +62,7 @@ async def canonical_guild_lock(request, call_next):
     return response
 
 def auth(x_admin_key:str|None):
-    expected=os.getenv('ADMIN_API_KEY','')
+    expected=_admin_key()
     if expected and x_admin_key!=expected: raise HTTPException(401,'Invalid admin key')
 
 def _database_label():
@@ -108,6 +131,26 @@ def startup():
             print('[INTEGRITY] Namespace: '+('OK' if not foreign else 'ATENCAO '+', '.join(foreign)))
     except Exception as exc:
         print(f'[INTEGRITY] ERRO no preflight: {type(exc).__name__}: {exc}')
+
+LOGIN_HTML=r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Clutch Control - Login</title><style>body{margin:0;background:#090a0b;color:#f5f6f7;font:14px system-ui;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,88vw);background:#141516;border:1px solid #292c2f;border-radius:22px;padding:28px;box-shadow:0 24px 80px #0008}.brand{font-size:20px;font-weight:900;margin-bottom:24px}.mark{display:inline-grid;place-items:center;width:32px;height:32px;border-radius:10px;background:#d7ff00;color:#090a0b;margin-right:10px}h1{margin:0 0 8px;font-size:30px}.muted{color:#8d9197;margin-bottom:18px}input{width:100%;box-sizing:border-box;background:#0e0f10;border:1px solid #303337;color:white;border-radius:12px;padding:13px;margin:8px 0 12px}button{width:100%;border:0;border-radius:12px;background:#d7ff00;color:#090a0b;padding:13px;font-weight:900;cursor:pointer}.err{color:#ff5d70;min-height:20px;margin-top:10px}</style></head><body><div class="box"><div class="brand"><span class="mark">C</span>CLUTCH CONTROL</div><h1>Acesso administrativo</h1><div class="muted">Entre com a chave administrativa configurada no Railway.</div><input id="key" type="password" autocomplete="current-password" placeholder="ADMIN_API_KEY"><button id="go">ENTRAR</button><div class="err" id="err"></div></div><script>async function login(){const key=document.getElementById('key').value;document.getElementById('err').textContent='';const r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});if(r.ok){location.replace('/');return}document.getElementById('err').textContent='Chave invalida.'}document.getElementById('go').onclick=login;document.getElementById('key').addEventListener('keydown',e=>{if(e.key==='Enter')login()});</script></body></html>'''
+
+@app.get('/login',response_class=HTMLResponse,include_in_schema=False)
+def login_page(request:Request):
+    if _session_ok(request): return RedirectResponse('/',status_code=303)
+    return HTMLResponse(LOGIN_HTML,headers={'Cache-Control':'no-store'})
+
+@app.post('/auth/login',include_in_schema=False)
+def login_action(payload:dict=Body(default={})):
+    expected=_admin_key(); supplied=str(payload.get('key') or '')
+    if not expected or not hmac.compare_digest(supplied,expected):
+        raise HTTPException(401,'Invalid admin key')
+    r=JSONResponse({'ok':True})
+    r.set_cookie(SESSION_COOKIE,_session_value(),httponly=True,secure=True,samesite='strict',max_age=60*60*12,path='/')
+    return r
+
+@app.post('/auth/logout',include_in_schema=False)
+def logout():
+    r=JSONResponse({'ok':True}); r.delete_cookie(SESSION_COOKIE,path='/'); return r
 
 @app.get('/favicon.ico', include_in_schema=False)
 def favicon(): return Response(status_code=204)
@@ -683,7 +726,9 @@ def identity_bootstrap_v3452():
     return HTMLResponse(html, headers={'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0','Pragma':'no-cache','Expires':'0','Clear-Site-Data':'"cache"'})
 
 @app.get('/',response_class=HTMLResponse)
-def home(): return HTML
+def home(request:Request):
+    if not _session_ok(request): return RedirectResponse('/login',status_code=303)
+    return HTMLResponse(HTML,headers={'Cache-Control':'no-store'})
 
 HTML=r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Clutch Control</title><style>
 :root{--bg:#090a0b;--p:#141516;--p2:#1b1d1f;--line:#292c2f;--muted:#8d9197;--text:#f5f6f7;--a:#d7ff00;--ok:#72e58c;--warn:#ffcf4a;--bad:#ff5d70}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% -15%,#262b00,transparent 27%),var(--bg);color:var(--text);font:14px Inter,system-ui,sans-serif}.shell{max-width:1500px;margin:auto;padding:22px}.top{display:flex;align-items:center;gap:28px;height:68px}.brand{font-weight:950;font-size:18px;display:flex;gap:10px;align-items:center}.mark{background:var(--a);color:#090a0b;width:32px;height:32px;border-radius:10px;display:grid;place-items:center}.nav{display:flex;gap:5px;flex:1}.nav button{border:0;background:transparent;color:#85898f;padding:10px 13px;border-radius:12px;font-weight:750;cursor:pointer}.nav button.active,.nav button:hover{background:#1b1d1f;color:#fff}.hero{margin:28px 0 20px}.ey{color:var(--a);font-weight:850;font-size:11px;letter-spacing:1.8px}.hero h1{font-size:42px;margin:4px 0 2px;letter-spacing:-2px}.muted{color:var(--muted)}.view{display:none}.view.active{display:block}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card{background:linear-gradient(145deg,#17191a,#111213);border:1px solid #25282a;border-radius:21px;padding:19px;box-shadow:0 20px 60px #0004}.accent{background:var(--a);color:#090a0b;border:0}.span2{grid-column:span 2}.span4{grid-column:span 4}.label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px}.accent .label{color:#333}.metric{font-size:34px;font-weight:950;letter-spacing:-1.5px;margin-top:7px}.title{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}.title h3{margin:0}.list{display:grid;gap:8px}.item{background:#1a1c1e;border:1px solid var(--line);padding:12px 14px;border-radius:14px;display:flex;gap:12px;align-items:center;cursor:pointer}.item:hover{border-color:#586000}.grow{flex:1}.badge{font-size:10px;font-weight:850;padding:5px 8px;border-radius:999px;background:#282b2d}.money{font-weight:900}.table{width:100%;border-collapse:separate;border-spacing:0 7px}.table th{text-align:left;color:#777c82;font-size:10px;text-transform:uppercase;padding:0 10px}.table td{background:#191b1d;border-top:1px solid #26292c;border-bottom:1px solid #26292c;padding:11px 10px}.table td:first-child{border-left:1px solid #26292c;border-radius:12px 0 0 12px}.table td:last-child{border-right:1px solid #26292c;border-radius:0 12px 12px 0}.btn{border:0;border-radius:11px;background:var(--a);color:#090a0b;padding:9px 12px;font-weight:900;cursor:pointer}.btn.dark{background:#272a2d;color:white}.form{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.form input,.form textarea,.form select{width:100%;background:#0e0f10;border:1px solid #303337;color:#fff;border-radius:11px;padding:11px}.form textarea{grid-column:span 2;min-height:72px}.detail{display:none;margin-top:14px}.detail.open{display:block}.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.mini{background:#1b1d1f;border:1px solid var(--line);border-radius:14px;padding:13px}.mini b{display:block;font-size:19px}.footer{text-align:center;color:#555b60;padding:28px}.danger{color:var(--bad)}.ok{color:var(--ok)}
@@ -698,7 +743,7 @@ HTML=r'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta nam
 <section id="inventory" class="view"><div class="card"><div class="title"><h3>Inventory</h3><span class="muted">SK-XXXXX · origem · custo · venda</span></div><div id="skinTable"></div></div></section>
 <div class="footer">CLUTCH OS V3.7.5 · ONBOARDING GATE · SINGLE SOURCE OF TRUTH</div></div><script>
 const BRL=new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'});let G='',K='';function money(v){return v===null||v===undefined?'Aguardando CMV':BRL.format(Number(v||0))}function esc(s){return String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}async function api(p,opt={}){let h={'Content-Type':'application/json'};if(K)h['X-Admin-Key']=K;let r=await fetch(p,{...opt,headers:{...h,...(opt.headers||{})}});if(!r.ok)throw Error(await r.text());return r.status===204?{}:r.json()}function set(id,v){let e=document.getElementById(id);if(e)e.textContent=v}function go(v){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));document.getElementById(v).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.v===v));set('pageTitle',v[0].toUpperCase()+v.slice(1));if(v==='trading')loadTrading();if(v==='finance')loadFinance();if(v==='operations')loadOps();if(v==='inventory')loadInventory();if(v==='customers')loadCustomers();if(v==='reconciliation')loadReconciliation();if(v==='system')loadSystem()}document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>go(b.dataset.v));
-let identityReady=null;async function resolveIdentity(){if(!identityReady){identityReady=(async()=>{localStorage.removeItem('clutchGuild');sessionStorage.removeItem('clutchGuild');const ident=await api('/api/v1/identity');const gid=String(ident.canonical_guild_id||'');if(!gid)throw Error('Frontend Identity Bootstrap: guild canônica ausente');return gid})()}return identityReady}async function boot(){try{let q=new URLSearchParams(location.search);K=q.get('key')||localStorage.getItem('clutchKey')||'';G=await resolveIdentity();if(K)localStorage.setItem('clutchKey',K);const dx=await api('/api/v1/diagnostics/'+G);if(!dx.ok)console.warn('Production Integrity diagnostics',dx);let [d,f]=await Promise.all([api('/api/v1/dashboard/'+G),api('/api/v1/finance/'+G)]);set('cash',money(f.cash));set('inventoryCapital',money(f.inventory));set('receivables',money(f.receivables));set('tradeins',d.tradeins_open);set('ops',d.operations_open);set('orders',d.orders_open);set('sales',d.sales_open);set('revenue',money(d.revenue));set('profit',money(d.realized_profit));set('potential',money(d.inventory_sale_value));set('tradeCredit',money(f.trade_credit_open));set('tradeAssets',money(f.trade_assets));set('negProfit',money(f.projected_negotiation_profit));document.body.dataset.dataState='ready'}catch(e){document.body.dataset.dataState='error';console.error('CLUTCH BOOT FAILED',e);['cash','inventoryCapital','receivables','revenue','profit','potential'].forEach(id=>set(id,'ERRO'));set('sub','Falha ao carregar dados. O sistema não substitui erros por zero. Consulte o log/API.')}}
+let identityReady=null;async function resolveIdentity(){if(!identityReady){identityReady=(async()=>{localStorage.removeItem('clutchGuild');sessionStorage.removeItem('clutchGuild');const ident=await api('/api/v1/identity');const gid=String(ident.canonical_guild_id||'');if(!gid)throw Error('Frontend Identity Bootstrap: guild canônica ausente');return gid})()}return identityReady}async function boot(){try{G=await resolveIdentity();const dx=await api('/api/v1/diagnostics/'+G);if(!dx.ok)console.warn('Production Integrity diagnostics',dx);let [d,f]=await Promise.all([api('/api/v1/dashboard/'+G),api('/api/v1/finance/'+G)]);set('cash',money(f.cash));set('inventoryCapital',money(f.inventory));set('receivables',money(f.receivables));set('tradeins',d.tradeins_open);set('ops',d.operations_open);set('orders',d.orders_open);set('sales',d.sales_open);set('revenue',money(d.revenue));set('profit',money(d.realized_profit));set('potential',money(d.inventory_sale_value));set('tradeCredit',money(f.trade_credit_open));set('tradeAssets',money(f.trade_assets));set('negProfit',money(f.projected_negotiation_profit));document.body.dataset.dataState='ready'}catch(e){document.body.dataset.dataState='error';console.error('CLUTCH BOOT FAILED',e);['cash','inventoryCapital','receivables','revenue','profit','potential'].forEach(id=>set(id,'ERRO'));set('sub','Falha ao carregar dados. O sistema não substitui erros por zero. Consulte o log/API.')}}
 async function loadOps(){let [sum,ords]=await Promise.all([api('/api/v1/operations-summary/'+G),api('/api/v1/orders/'+G)]);let ops=sum.active||[];let hist=sum.history||[];document.getElementById('opList').innerHTML=ops.length?ops.map(x=>`<div class="item"><span class="badge">${esc(x.kind)}</span><div class="grow"><b>${esc(x.ref_code)} · ${esc(x.title)}</b><div class="muted">${esc(x.status)} · prioridade ${esc(x.priority)} · responsável ${x.assigned_to||'—'}${x.staff_message_id?' · Discord ✓':' · Discord pendente'}</div></div></div>`).join(''):'<div class="muted">Fila ativa vazia.</div>';let he=document.getElementById('opHistory');if(he)he.innerHTML=hist.length?hist.map(x=>`<div class="item"><span class="badge">${esc(x.status)}</span><div class="grow"><b>${esc(x.ref_code)} · ${esc(x.title)}</b></div></div>`).join(''):'<div class="muted">Sem histórico.</div>';document.getElementById('orderList').innerHTML=ords.length?ords.map(x=>`<div class="item"><span class="badge">${esc(x.status)}</span><div class="grow"><b>${esc(x.code)} · ${esc(x.skin_name)}</b><div class="muted">Orçamento ${money(x.budget)} · custo ${money(x.found_price)} · cliente ${money(x.customer_price)} · ${esc(x.supplier||'sem fornecedor')}</div></div></div>`).join(''):'<div class="muted">Sem encomendas.</div>'}
 async function loadTrading(){let [ns,f,cs]=await Promise.all([api('/api/v1/negotiations/'+G),api('/api/v1/finance/'+G),api('/api/v1/customers/'+G)]);set('tradeCredit',money(f.trade_credit_open));set('tradeAssets',money(f.trade_assets));set('negProfit',money(f.projected_negotiation_profit));let cu=document.getElementById('nUser'),prev=cu.value;cu.innerHTML='<option value="">Selecione o cliente / CRM</option>'+cs.map(c=>`<option value="${esc(c.code)}">${esc(c.display_name)} · ${esc(c.code)}</option>`).join('');if([...cu.options].some(o=>o.value===prev))cu.value=prev;cu.onchange=refreshCustomerOrders;await refreshCustomerOrders();document.getElementById('negList').innerHTML=ns.length?ns.map(n=>`<div class="item" onclick="openNeg('${n.code}')"><span class="badge">${esc(n.status)}</span><div class="grow"><b>${n.code} · Trade-In</b><div class="muted">Venda ${money(n.sale_total)} · crédito ${money(n.trade_credit)} · dinheiro ${money(n.cash_received)} / ${money(n.cash_due)}</div></div><b>${money(n.projected_profit)}</b></div>`).join(''):'<div class="muted">Nenhuma negociação criada.</div>'}
 async function openNeg(code){let n=await api('/api/v1/negotiation/'+G+'/'+code),d=document.getElementById('negDetail');d.className='detail open';let action=x=>x.status==='EXPECTED'?`<button class="btn dark" onclick="transitionTI('${n.code}','${x.code}','RECEIVE')">Confirmar recebimento</button>`:x.status==='RECEIVED'?`<button class="btn dark" onclick="transitionTI('${n.code}','${x.code}','INSPECT')">Inspecionar</button>`:x.status==='INSPECTED'?`<button class="btn" onclick="transitionTI('${n.code}','${x.code}','ACCEPT')">Aceitar no estoque</button>`:'';d.innerHTML=`<div class="card"><div class="title"><h3>${n.code}</h3><span class="badge">${n.status}</span></div><div class="kpis"><div class="mini"><span class="muted">Venda</span><b>${money(n.sale_total)}</b></div><div class="mini"><span class="muted">Custo encomendas</span><b>${n.costs_known?money(n.order_cost):'Aguardando CMV'}</b></div><div class="mini"><span class="muted">Lucro projetado</span><b>${money(n.projected_profit)}</b></div></div><div class="muted" style="margin-top:10px">Trade-In: ${money(n.accepted_trade_value)} aceito / ${money(n.trade_credit)} · Caixa: ${money(n.cash_received)} / ${money(n.cash_due)}</div><h4>Skins do Trade-In</h4><div class="list">${n.items.map(x=>`<div class="item"><div class="grow"><b>${x.code} · ${esc(x.name)}</b><div class="muted">${esc(x.exterior)} · float ${esc(x.float)} · ${esc(x.status)}${x.stock_skin_id?' · SK criada':''}</div></div><b>${money(x.credit_value)}</b>${action(x)}${['EXPECTED','RECEIVED','INSPECTED'].includes(x.status)?`<button class="btn dark" onclick="transitionTI('${n.code}','${x.code}','REJECT')">Rejeitar</button>`:''}</div>`).join('')||'<span class="muted">Nenhuma.</span>'}</div><h4>Adicionar skin</h4><div class="form"><input id="iName" placeholder="Skin"><input id="iExt" placeholder="Exterior"><input id="iFloat" placeholder="Float"><input id="iPattern" placeholder="Pattern"><input id="iCredit" placeholder="Crédito atribuído"></div><button class="btn" onclick="addItem('${n.code}')" style="margin-top:8px">Adicionar TI-XXXXX</button><h4>Registrar pagamento</h4><div class="form"><input id="pAmount" placeholder="Valor"><input id="pRef" placeholder="Referência (PIX)"></div><button class="btn" onclick="addPay('${n.code}')" style="margin-top:8px">Registrar recebimento</button>${n.cash_received===0&&n.accepted_trade_value===0?`<button class="btn dark" onclick="cancelNeg('${n.code}')" style="margin:8px">Cancelar negociação</button>`:''}</div>`;d.scrollIntoView({behavior:'smooth'})}
