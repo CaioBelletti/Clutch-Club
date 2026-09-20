@@ -177,7 +177,7 @@ def inspect_skin(skin_code:str):
     page=f'''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Inspecionar {safe_code} no CS2</title>
 <style>body{{margin:0;background:#090909;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh}}.card{{width:min(520px,88vw);background:#111;border:1px solid #b9903b;border-radius:18px;padding:28px;text-align:center;box-shadow:0 20px 70px #000}}h1{{color:#e0b85a}}p{{color:#bbb;line-height:1.5}}button{{border:0;border-radius:10px;padding:15px 22px;background:#d6a94b;color:#080808;font-weight:800;font-size:16px;cursor:pointer}}small{{display:block;color:#777;margin-top:18px}}</style></head><body><div class="card"><h1>🎮 ABRIR NO CS2</h1><h2>{safe_name}</h2><p>O navegador tentará abrir a Steam. Confirme <b>Abrir Steam</b> para inspecionar esta skin dentro do CS2.</p><button id="open">ABRIR NO CS2</button><small>CLUTCH CLUB • PLAY • TRADE • EVOLVE</small></div>
 <script>const uri={js_uri}; function openCS2(){{window.location.href=uri}} document.getElementById('open').onclick=openCS2; setTimeout(openCS2,350);</script></body></html>'''
-    return HTMLResponse(page,headers={{'Cache-Control':'no-store'}})
+    return HTMLResponse(page, headers={'Cache-Control':'no-store'})
 
 @app.get('/health')
 def health(): return {'ok':True,'service':'clutch-os','version':'3.7.5','control_center':True,'database':_database_label()}
