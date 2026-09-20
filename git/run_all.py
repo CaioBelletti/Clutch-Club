@@ -16,22 +16,11 @@ if port_in_use(port=PORT):
     raise SystemExit(3)
 
 db_url=(os.getenv('DATABASE_URL') or '').strip().lower()
-
-# Diagnóstico seguro: não mostra usuário, senha, host nem a URL completa.
-print(
-    '[ENV] DATABASE_URL:',
-    'CONFIGURADA' if db_url else 'AUSENTE',
-    '| tipo:',
-    db_url.split('://',1)[0] if '://' in db_url else 'SEM_PROTOCOLO'
-)
-
 if db_url.startswith(('postgres://','postgresql://','postgresql+psycopg://')):
     print('[DATA] Railway/PostgreSQL detectado: recovery SQLite local ignorado.')
 else:
-    print('[DATA] PostgreSQL não detectado: iniciando recovery SQLite local.')
     from data_bootstrap import prepare
     prepare()
-
 HOST='127.0.0.1'
 URL=f'http://{HOST}:{PORT}/'
 BOOT_URL=f'http://{HOST}:{PORT}/identity-bootstrap-v351'

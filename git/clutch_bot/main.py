@@ -41,7 +41,8 @@ from .config import *
 from .db import init_db,Session
 from .models import Skin,Panel,Buylist,Interest,Order,Feedback,Ledger,Sale,Operation,Negotiation,NegotiationOrder,TradeInItem,NegotiationPayment,Audit
 from .services import *
-intents=discord.Intents.default();bot=commands.Bot(command_prefix='!',intents=intents)
+intents=discord.Intents.default(); intents.members=True
+bot=commands.Bot(command_prefix='!',intents=intents)
 def gid(i):return i.guild.id if i.guild else (GUILD_ID or 0)
 
 def canonical_order_guild(requested=0):
@@ -70,6 +71,78 @@ def customer_role(guild_id):
     rid=cfg(guild_id,'customer_role_id')
     guild=bot.get_guild(int(guild_id))
     return guild.get_role(int(rid)) if guild and rid else None
+
+async def ensure_negotiation_ticket(guild_id:int,user_id:int,code:str,kind:str,title:str,description:str):
+    """Create/reuse one private Discord ticket for a negotiation. Never creates a second business operation."""
+    guild=bot.get_guild(int(guild_id))
+    if not guild:return None
+    key=f'ticket_channel_{code.upper()}'
+    existing=cfg(guild_id,key)
+    if existing:
+        ch=guild.get_channel(int(existing))
+        if isinstance(ch,discord.TextChannel):return ch
+    member=guild.get_member(int(user_id))
+    if member is None:
+        try:member=await guild.fetch_member(int(user_id))
+        except:return None
+    cat=None
+    cat_id=cfg(guild_id,'tickets_category_id')
+    if cat_id:cat=guild.get_channel(int(cat_id))
+    if not isinstance(cat,discord.CategoryChannel):
+        cat=discord.utils.get(guild.categories,name='NEGOCIAÇÕES')
+    if not isinstance(cat,discord.CategoryChannel):
+        try:
+            cat=await guild.create_category('NEGOCIAÇÕES',reason='Clutch OS - tickets privados')
+            set_cfg(guild_id,'tickets_category_id',cat.id)
+        except Exception as e:
+            print(f'[TICKET] categoria: {type(e).__name__}: {e}');return None
+    overwrites={guild.default_role:discord.PermissionOverwrite(view_channel=False),member:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)}
+    if guild.me:overwrites[guild.me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,manage_channels=True)
+    for role in guild.roles:
+        if role.is_default():continue
+        if role.permissions.administrator or role.permissions.manage_guild:
+            overwrites[role]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
+    safe=code.lower().replace('_','-')
+    emoji={'SALE':'🛒','ORDER':'📦','BUYLIST':'💰'}.get(kind,'🎫')
+    try:
+        ch=await guild.create_text_channel(f'{emoji}・{safe}',category=cat,overwrites=overwrites,reason=f'Clutch OS ticket {code}')
+        set_cfg(guild_id,key,ch.id)
+        e=discord.Embed(title=title,description=description,color={'SALE':0x57F287,'ORDER':0x5865F2,'BUYLIST':0xFEE75C}.get(kind,0x5865F2))
+        e.add_field(name='Negociação',value=f'`{code}`');e.add_field(name='Cliente',value=member.mention)
+        e.set_footer(text='CLUTCH CLUB • atendimento privado e verificado')
+        await ch.send(content=member.mention,embed=e)
+        print(f'[TICKET] {code} -> #{ch.name} ({ch.id})')
+        return ch
+    except Exception as e:
+        print(f'[TICKET] {code}: {type(e).__name__}: {e}');return None
+
+async def ticket_notice(guild_id:int,code:str,text:str,view=None):
+    cid=cfg(guild_id,f'ticket_channel_{code.upper()}')
+    if not cid:return False
+    ch=bot.get_channel(int(cid))
+    if not isinstance(ch,discord.TextChannel):return False
+    try:await ch.send(text,view=view);return True
+    except Exception as e:print(f'[TICKET] aviso {code}: {type(e).__name__}: {e}');return False
+
+async def close_negotiation_ticket(guild_id:int,code:str,reason='Negociação encerrada'):
+    cid=cfg(guild_id,f'ticket_channel_{code.upper()}')
+    ch=bot.get_channel(int(cid)) if cid else None
+    if not isinstance(ch,discord.TextChannel):return
+    try:
+        await ch.send(f'🔒 **{reason}.** Este ticket foi arquivado e permanece disponível para histórico.')
+        await ch.edit(name=f'🔒・{code.lower()}',reason=f'Clutch OS - {reason}')
+        member_id=None
+        with Session() as s:
+            if code.startswith('VD-'):
+                x=s.scalar(select(Sale).where(Sale.guild_id==guild_id,Sale.code==code));member_id=x.buyer_id if x else None
+            elif code.startswith('ENC-'):
+                x=s.scalar(select(Order).where(Order.guild_id==guild_id,Order.code==code));member_id=x.user_id if x else None
+            elif code.startswith('BL-'):
+                x=s.scalar(select(Buylist).where(Buylist.guild_id==guild_id,Buylist.code==code));member_id=x.user_id if x else None
+        if member_id:
+            m=ch.guild.get_member(int(member_id))
+            if m:await ch.set_permissions(m,view_channel=True,send_messages=False,read_message_history=True,reason='Negociação encerrada')
+    except Exception as e:print(f'[TICKET] fechar {code}: {type(e).__name__}: {e}')
 
 async def notify_operations_event(o, title, text, color=0x5865F2):
     """Make customer proposal decisions visible to staff immediately."""
@@ -226,7 +299,8 @@ class BuyModal(discord.ui.Modal,title='Vender uma skin'):
             b=Buylist(code='PENDING',guild_id=gid(i),user_id=i.user.id,skin_name=self.skin.value,exterior=self.exterior.value.upper(),floatv=self.floatv.value.replace(',','.'),pattern=self.extra.value[:120] or None,desired_price=d,status='PENDING');s.add(b);s.flush();b.code=f'BL-{b.id:05d}';log(s,gid(i),i.user.id,'BUYLIST_CREATE','buylist',b.id,b.skin_name)
         opid=queue_operation(gid(i),'BUYLIST',b.code,b.id,i.user.id,f'BUYLIST — {b.code}',f'**Skin:** {b.skin_name}\n**Exterior:** {b.exterior}\n**Float:** {b.floatv}\n**Desejado:** {money(d)}','HIGH')
         await publish_operation(opid)
-        await i.response.send_message(f'✅ **{b.code}** criada por {money(d)}. A equipe foi notificada para análise.',ephemeral=True)
+        await ensure_negotiation_ticket(gid(i),i.user.id,b.code,'BUYLIST',f'💰 BUYLIST — {b.code}',f'**Skin:** {b.skin_name}\n**Exterior:** {b.exterior}\n**Float:** {b.floatv}\n**Valor desejado:** {money(d)}\n\nUse este canal para acompanhar toda a negociação com a equipe.')
+        await i.response.send_message(f'✅ **{b.code}** criada por {money(d)}. Seu ticket privado foi aberto e a equipe foi notificada.',ephemeral=True)
 
 def _code_from_interaction_message(i, prefix):
     import re
@@ -296,6 +370,7 @@ class OrderModal(discord.ui.Modal,title='Encomendar uma skin'):
         result=OrderService.create(gid(i),i.user.id,getattr(i.user,'display_name',None) or str(i.user),self.skin.value,self.exterior.value,self.maxfloat.value,self.budget.value,self.notes.value)
         oid=result['order_id'];ocode=result['code'];opid=result['operation_id']
         published=await publish_operation(opid)
+        await ensure_negotiation_ticket(gid(i),i.user.id,ocode,'ORDER',f'📦 ENCOMENDA — {ocode}',f'**Skin:** {self.skin.value}\n**Exterior:** {self.exterior.value.upper() or "—"}\n**Float máximo:** {self.maxfloat.value or "—"}\n**Orçamento:** {money(D(self.budget.value)) if self.budget.value else "—"}\n\nA equipe acompanhará sua encomenda por este canal.')
         e=discord.Embed(title=f'📦 ENCOMENDA {ocode} REGISTRADA',description='Confira abaixo exatamente o que você pediu.',color=0x5865F2)
         e.add_field(name='Skin',value=self.skin.value,inline=False);e.add_field(name='Exterior',value=self.exterior.value.upper() or '—');e.add_field(name='Float máximo',value=self.maxfloat.value or '—');e.add_field(name='Orçamento máximo',value=money(D(self.budget.value)) if self.budget.value else '—');e.add_field(name='Observações',value=self.notes.value or '—',inline=False);e.add_field(name='Status',value='🟡 ABERTA / AGUARDANDO ANÁLISE',inline=False)
         e.set_footer(text='A equipe foi notificada. Não envie pagamento antes de uma proposta oficial da Clutch Club.')
@@ -352,9 +427,11 @@ async def notify_order_customer(o):
     public={'SEARCHING':'🔎 Nossa equipe começou a procurar sua skin.','FOUND':'🎯 Encontramos uma opção compatível. A equipe está preparando os detalhes.','PROPOSAL_SENT':'💰 Uma proposta oficial foi preparada para sua encomenda.','CUSTOMER_ACCEPTED':'🤝 Sua proposta foi marcada como aceita.','PAYMENT_PENDING':'💳 Aguardando a confirmação do pagamento.','PAYMENT_CONFIRMED':'✅ Pagamento confirmado. A equipe seguirá com a aquisição.','AWAITING_ACQUISITION':'🛒 Estamos aguardando/finalizando a aquisição da skin.','ACQUIRED':'✅ A skin foi adquirida pela Clutch Club.','TRADE_LOCK':f'🔒 A skin está em Trade Lock'+(f' até {trade_lock_display(o.trade_lock_until)}' if o.trade_lock_until else '')+'.','READY':'📦 Sua skin está pronta para entrega.','DELIVERED':'🎉 Encomenda entregue. Obrigado por negociar com a Clutch Club!','CANCELLED':'❌ Sua encomenda foi cancelada.'}
     msg=public.get(o.status)
     if not msg:return
+    await ticket_notice(o.guild_id,o.code,f'**📦 {o.code} — {order_status_label(o.status)}**\n{msg}')
     try:
         u=bot.get_user(o.user_id) or await bot.fetch_user(o.user_id);await u.send(f'**📦 {o.code} — {order_status_label(o.status)}**\n{msg}')
     except:pass
+    if o.status in ('DELIVERED','CANCELLED'):await close_negotiation_ticket(o.guild_id,o.code,'Encomenda encerrada')
 async def sync_order_operation(o):
     with Session.begin() as s:
         op=s.scalar(select(Operation).where(Operation.guild_id==o.guild_id,Operation.kind=='ORDER',Operation.ref_code==o.code).order_by(Operation.id.desc()).with_for_update())
@@ -616,15 +693,16 @@ class OrderCustomerView(discord.ui.View):
     async def cancel(self,i,b):await i.response.send_modal(CancelOrderModal())
 
 class FeedbackModal(discord.ui.Modal,title='Avaliar negociação verificada'):
-    sale_code=discord.ui.TextInput(label='Código da venda',placeholder='VD-00001')
     rating=discord.ui.TextInput(label='Nota de 1 a 5',placeholder='5')
     comment=discord.ui.TextInput(label='Comentário',required=False,style=discord.TextStyle.paragraph)
+    def __init__(self,sale_code:str):
+        super().__init__();self.sale_code=sale_code.upper()
     async def on_submit(self,i):
         try:r=int(self.rating.value)
         except:r=0
         if r<1 or r>5:return await i.response.send_message('❌ Use uma nota de 1 a 5.',ephemeral=True)
         with Session.begin() as s:
-            sale=s.scalar(select(Sale).where(Sale.guild_id==gid(i),Sale.code==self.sale_code.value.upper(),Sale.buyer_id==i.user.id))
+            sale=s.scalar(select(Sale).where(Sale.guild_id==gid(i),Sale.code==self.sale_code,Sale.buyer_id==i.user.id))
             if not sale or sale.status!='COMPLETED':return await i.response.send_message('❌ Essa venda não existe, não pertence a você ou ainda não foi concluída.',ephemeral=True)
             old=s.scalar(select(Feedback).where(Feedback.sale_id==sale.id))
             if old:return await i.response.send_message('⭐ Essa negociação já foi avaliada.',ephemeral=True)
@@ -633,10 +711,15 @@ class FeedbackModal(discord.ui.Modal,title='Avaliar negociação verificada'):
         if isinstance(ch,discord.TextChannel):
             stars='⭐'*r
             e=discord.Embed(title=f'{stars} • NEGOCIAÇÃO VERIFICADA',description=self.comment.value or 'Sem comentário.',color=0xFEE75C)
-            e.add_field(name='Negociação',value=self.sale_code.value.upper());e.add_field(name='Cliente',value=i.user.mention);e.set_footer(text='CLUTCH CLUB • avaliação vinculada a uma venda concluída')
+            e.add_field(name='Negociação',value=self.sale_code);e.add_field(name='Cliente',value=i.user.mention);e.set_footer(text='CLUTCH CLUB • avaliação vinculada a uma venda concluída')
             try:await ch.send(embed=e)
             except:pass
         await i.response.send_message('⭐ Obrigado! Sua avaliação verificada foi registrada.',ephemeral=True)
+
+class VerifiedFeedbackView(discord.ui.View):
+    def __init__(self,sale_code:str):super().__init__(timeout=604800);self.sale_code=sale_code.upper()
+    @discord.ui.button(label='AVALIAR NEGOCIAÇÃO',emoji='⭐',style=discord.ButtonStyle.primary)
+    async def go(self,i,b):await i.response.send_modal(FeedbackModal(self.sale_code))
 
 class ProposalResponseView(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
@@ -662,11 +745,6 @@ class ProposalResponseView(discord.ui.View):
         code=_code_from_interaction_message(i,'BL')
         if not code:return await i.response.send_message('❌ Não consegui identificar a Buylist desta proposta.',ephemeral=True)
         await i.response.send_modal(CounterModal(code))
-
-class VerifiedFeedbackView(discord.ui.View):
-    def __init__(self):super().__init__(timeout=None)
-    @discord.ui.button(label='AVALIAR NEGOCIAÇÃO',emoji='⭐',style=discord.ButtonStyle.primary,custom_id='v21:feedback:verified')
-    async def go(self,i,b):await i.response.send_modal(FeedbackModal())
 
 class TradeLockModal(discord.ui.Modal,title='Registrar Trade Lock'):
     trade_lock_ate=discord.ui.TextInput(label='Trade Lock até',placeholder='Ex.: 26/09/2026 14:30',required=True,max_length=16)
@@ -754,6 +832,8 @@ async def refresh_buylist_operation(code:str,guild_id:int):
         elif b.status in ('COUNTERED','ACCEPTED','RECEIVED','PAID'):op.status='ACTION_REQUIRED'
         elif b.status in ('COMPLETED','REJECTED','EXPIRED'):op.status='DONE'
         oid=op.id;mid=op.staff_message_id;cid=op.staff_channel_id
+    await ticket_notice(guild_id,code,f'📌 **{code} — {b.status}**')
+    if b.status in ('COMPLETED','REJECTED','EXPIRED'):await close_negotiation_ticket(guild_id,code,'Buylist encerrada')
     if mid and cid:
         ch=bot.get_channel(cid)
         if ch:
@@ -774,6 +854,8 @@ async def refresh_sale_operation(code:str,guild_id:int):
         op.detail=f'**Skin:** {skin.code if skin else "—"} • {skin.name if skin else "—"}\n**Valor:** {money(sale.sale_price)}\n**Etapa:** {label}'
         op.status='DONE' if sale.status=='COMPLETED' else ('CANCELLED' if sale.status=='CANCELLED' else 'ACTION_REQUIRED')
         oid=op.id;mid=op.staff_message_id;cid=op.staff_channel_id
+    await ticket_notice(guild_id,code,f'📌 **{code} — {label}**')
+    if sale.status in ('COMPLETED','CANCELLED'):await close_negotiation_ticket(guild_id,code,'Venda encerrada')
     if mid and cid:
         ch=bot.get_channel(cid)
         if ch:
@@ -1024,7 +1106,8 @@ class SkinPurchaseView(discord.ui.View):
         await refresh_skin(x.id)
         opid=queue_operation(gid(i),'SALE',sale.code,sale.id,i.user.id,f'RESERVA / VENDA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\nReserva por {RESERVATION_MINUTES} minutos.','HIGH')
         await publish_operation(opid)
-        await i.response.send_message(f'🔒 **{x.code}** reservada por {RESERVATION_MINUTES} min. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. A equipe já foi notificada.',ephemeral=True)
+        await ensure_negotiation_ticket(gid(i),i.user.id,sale.code,'SALE',f'🛒 COMPRA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\n**Reserva:** {RESERVATION_MINUTES} minutos\n\nA equipe continuará o pagamento e a entrega por este ticket.')
+        await i.response.send_message(f'🔒 **{x.code}** reservada por {RESERVATION_MINUTES} min. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. Seu ticket privado foi aberto.',ephemeral=True)
 
 class PublicPanel(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
@@ -1119,12 +1202,28 @@ async def post_sold(sale,x):
 async def invite_feedback(sale):
     try:
         u=bot.get_user(sale.buyer_id) or await bot.fetch_user(sale.buyer_id)
-        await u.send(f'⭐ Sua compra **{sale.code}** foi concluída. Se quiser, avalie sua experiência com a Clutch Club.',view=VerifiedFeedbackView())
+        await u.send(f'⭐ Sua compra **{sale.code}** foi concluída. Se quiser, avalie sua experiência com a Clutch Club.',view=VerifiedFeedbackView(sale.code))
     except:pass
 
 @tasks.loop(minutes=1)
 async def housekeeping():expire_reservations()
 _startup_done=False
+@bot.event
+async def on_member_join(member:discord.Member):
+    """Individual welcome message. The fixed onboarding panel remains the access gate."""
+    if member.bot:return
+    ch_id=cfg(member.guild.id,'welcome_channel_id')
+    ch=bot.get_channel(int(ch_id)) if ch_id else None
+    if not isinstance(ch,discord.TextChannel):
+        print(f'[WELCOME] {member} entrou, mas welcome_channel_id não está configurado.')
+        return
+    try:
+        e=discord.Embed(title='👋 BEM-VINDO À CLUTCH CLUB!',description=f'{member.mention}, seja muito bem-vindo(a)!\n\nPara liberar seu acesso à **Loja** e à **Comunidade**, use o botão **ENTRAR PARA O CLUB** no painel deste canal.\n\n📜 Confira **Como Funciona**\n🛡️ Leia **Segurança**\n🤝 Negocie somente pelos canais oficiais.',color=0xF1C40F)
+        e.set_footer(text='CLUTCH CLUB • PLAY • TRADE • JOIN THE CLUB.')
+        await ch.send(embed=e)
+        print(f'[WELCOME] mensagem enviada para {member} ({member.id}) em #{ch.name}.')
+    except Exception as e:print(f'[WELCOME] falha para {member}: {type(e).__name__}: {e}')
+
 @bot.event
 async def on_ready():
     global _startup_done
@@ -1137,7 +1236,7 @@ async def on_ready():
     except Exception as e:
         print(f'[CLUTCH DATA] Nao foi possivel exibir o caminho do banco: {e}')
     if not _startup_done:
-        for v in (PublicPanel(),CatalogPanel(),InterestPanel(),OrderPanel(),ProposalResponseView(),VerifiedFeedbackView(),OperationsView(),OrderCustomerView(),OnboardingView(),SkinPurchaseView()):
+        for v in (PublicPanel(),CatalogPanel(),InterestPanel(),OrderPanel(),ProposalResponseView(),OperationsView(),OrderCustomerView(),OnboardingView(),SkinPurchaseView()):
             bot.add_view(v)
         # V3.7.3: reaplica o botão COMPRAR nos anúncios já existentes do catálogo.
         try:
