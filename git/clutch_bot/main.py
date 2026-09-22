@@ -272,7 +272,11 @@ def log_customer_member_access(guild_id):
             seen.add(ch.id)
             d=member_access_details(member,ch)
             state='VÊ' if d['effective'] else 'NÃO VÊ'
-            verdict='OK' if d['effective']==expected else 'ERRO'
+            # Operations is intentionally visible to administrators/staff.
+            expected_for_member = expected
+            if key == 'operations' and (d['administrator'] or any(r.name in ('🛡️ Staff','👑 Fundador','Staff','Fundador') for r in member.roles)):
+                expected_for_member = True
+            verdict='OK' if d['effective']==expected_for_member else 'ERRO'
             print(f'[ACCESS MEMBER]   {key} #{ch.name}: {state} [{verdict}] @everyone={d["everyone"]} roles={d["roles"] or ["inherit"]} member={d["member"]} admin={d["administrator"]}')
 
 def operation_embed(op):
@@ -1083,6 +1087,22 @@ class OperationsView(discord.ui.View):
         except:pass
         await i.followup.send(f'✖️ {op.ref_code} encerrada.',ephemeral=True)
 
+class ClubQuickAccessView(discord.ui.View):
+    """V3.8.3: direct channel shortcuts; independent from Discord Community Onboarding."""
+    def __init__(self, guild_id:int):
+        super().__init__(timeout=300)
+        specs=[
+            ('🟢 CATÁLOGO','catalog'),
+            ('💰 VENDER','buylist'),
+            ('📦 ENCOMENDAR','order'),
+            ('🔔 INTERESSE','interest'),
+            ('⭐ AVALIAÇÕES','feedback'),
+        ]
+        for label,key in specs:
+            ch=channel(guild_id,key)
+            if isinstance(ch,discord.TextChannel):
+                self.add_item(discord.ui.Button(label=label,style=discord.ButtonStyle.link,url=f'https://discord.com/channels/{guild_id}/{ch.id}'))
+
 class OnboardingView(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
     @discord.ui.button(label='ENTRAR PARA O CLUB',emoji='👑',style=discord.ButtonStyle.success,custom_id='v367:onboarding:join')
@@ -1126,7 +1146,7 @@ class OnboardingView(discord.ui.View):
                     msg += f'\n\n🛒 **Acessos rápidos:** {channels_text}'
                 if already_member:
                     msg += '\n\n🔄 Você já era Cliente; o Clutch OS reconferiu seu acesso.'
-                await i.response.send_message(msg,ephemeral=True)
+                await i.response.send_message(msg,view=ClubQuickAccessView(i.guild.id),ephemeral=True)
             else:
                 print(f'[ONBOARDING ACCESS] falha para {i.user} ({i.user.id}): {access_details}')
                 await i.response.send_message('⚠️ Seu cargo **Cliente** foi aplicado, mas o Clutch OS encontrou uma divergência ao validar os canais. A equipe foi informada para corrigir o acesso.',ephemeral=True)
@@ -1137,7 +1157,7 @@ class OnboardingView(discord.ui.View):
             await i.response.send_message('❌ O Discord recusou a atualização do acesso neste momento. Tente novamente em alguns segundos.',ephemeral=True)
 
 def onboarding_embed():
-    e=discord.Embed(title='👑 BEM-VINDO À CLUTCH CLUB',description='Compra, venda, encomenda e comunidade de skins de CS2.\n\nAntes de começar:\n📜 Confira **Como Funciona**\n🛡️ Leia nossas orientações de **Segurança**\n🤝 Negocie somente pelos canais oficiais\n\nQuando estiver pronto, clique abaixo para liberar seu acesso.',color=0xF1C40F)
+    e=discord.Embed(title='👑 BEM-VINDO À CLUTCH CLUB',description='Sua central para **comprar, vender e encomendar skins de CS2**.\n\n📜 Confira **Como Funciona**\n🛡️ Leia nossas orientações de **Segurança**\n🤝 Negocie somente pelos canais oficiais\n\nClique em **ENTRAR PARA O CLUB**. O Clutch Bot libera/verifica seu cargo **💎 Cliente** e entrega atalhos diretos para a Loja — sem depender do Community Onboarding do Discord.',color=0xF1C40F)
     e.set_footer(text='CLUTCH CLUB • PLAY • TRADE • JOIN THE CLUB.')
     return e
 
