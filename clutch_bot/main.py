@@ -294,6 +294,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
+    print('[VERSION] CLUTCH OS V3.8.4.2 — BUYLIST 403 HOTFIX')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
