@@ -6,9 +6,6 @@ from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 import os
 
-print(f"[BOOT DEBUG] clutch_bot.main = {os.path.abspath(__file__)}")
-print("[VERSION] CLUTCH OS V3.8.4.2 — BUYLIST 403 HOTFIX")
-
 def utc_aware(dt):
     """Normalize SQLite/SQLAlchemy datetimes to timezone-aware UTC."""
     if dt is None:
@@ -297,7 +294,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.2 — BUYLIST 403 HOTFIX')
+    print('[VERSION] CLUTCH OS V3.8.4.3 — LEGACY UI MIGRATION')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -1350,6 +1347,93 @@ class OrderPanel(discord.ui.View):
     async def go(self,i,b):await i.response.send_modal(OrderModal())
 def panel_embed(k):
     data={'buylist':(('⏸️ BUYLIST TEMPORARIAMENTE PAUSADA','No momento a Clutch Club não está comprando skins diretamente. O histórico permanece preservado e o serviço poderá ser reativado pela equipe.') if not buylist_enabled() else ('💰 VENDA SUA SKIN PARA A CLUTCH CLUB','Envie sua skin para análise e receba uma proposta da nossa equipe. Clique abaixo para começar — nenhum /comando é necessário.')),'catalog':('🛒 CATÁLOGO CLUTCH CLUB','Veja as skins disponíveis e use o código SK-XXXXX para comprar ou reservar.'),'interest':('🔔 LISTA DE INTERESSE','Procurando uma skin específica? Cadastre seu interesse e avisaremos quando houver um match.'),'order':('📦 ENCOMENDE SUA SKIN','Não encontrou o que procura? Abra uma encomenda informando skin, exterior, float e orçamento.')};t,d=data[k];return discord.Embed(title=t,description=d,color=0x2B2D31)
+def _message_has_custom_id(msg, custom_id:str):
+    """Return True when a Discord message contains a component with custom_id."""
+    try:
+        for row in getattr(msg,'components',[]) or []:
+            for item in getattr(row,'children',[]) or []:
+                if getattr(item,'custom_id',None)==custom_id:
+                    return True
+    except Exception:
+        pass
+    return False
+
+async def cleanup_paused_buylist_legacy_panels(guild_id:int, canonical_message_id:int|None=None):
+    """V3.8.4.3: remove obsolete public buylist panels while paused.
+
+    Only bot-authored messages containing the old v2:buy:new button are touched.
+    Business history, negotiations and database records are never deleted.
+    """
+    if buylist_enabled():
+        return 0
+    ch=channel(guild_id,'buylist')
+    if not isinstance(ch,discord.TextChannel):
+        return 0
+    removed=0
+    try:
+        async for msg in ch.history(limit=100):
+            if canonical_message_id and msg.id==canonical_message_id:
+                continue
+            if not bot.user or msg.author.id!=bot.user.id:
+                continue
+            if not _message_has_custom_id(msg,'v2:buy:new'):
+                continue
+            try:
+                await msg.delete()
+                removed+=1
+            except discord.Forbidden:
+                # If deletion is unavailable, at least neutralize the obsolete action.
+                try:
+                    await msg.edit(embed=panel_embed('buylist'),view=None)
+                except Exception:
+                    pass
+            except discord.HTTPException:
+                try:
+                    await msg.edit(embed=panel_embed('buylist'),view=None)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f'[BUYLIST UI] aviso ao limpar painel legado: {type(e).__name__}: {e}')
+    if removed:
+        print(f'[BUYLIST UI] {removed} painel(is) legado(s) removido(s); painel pausado canônico preservado.')
+    return removed
+
+async def migrate_legacy_skin_edit_buttons(guild_id:int):
+    """V3.8.4.3 one-shot migration for catalog ads created before EDITAR SKIN.
+
+    Patches only AVAILABLE catalog messages missing v384:skin:edit, preserving the
+    same SK id, Discord message, image/embed data and all financial/history data.
+    A DB marker prevents mass PATCH on future boots after a fully successful pass.
+    """
+    marker='v3843_legacy_skin_edit_migrated'
+    if cfg(guild_id,marker)=='1':
+        print('[CATALOG MIGRATION] anúncios legados já migrados; nenhum PATCH necessário.')
+        return True
+    with Session() as s:
+        skins=list(s.scalars(select(Skin).where(Skin.guild_id==guild_id,Skin.status=='AVAILABLE')).all())
+    candidates=[x for x in skins if x.channel_id and x.message_id]
+    checked=patched=already=failed=0
+    for x in candidates:
+        ch=bot.get_channel(int(x.channel_id))
+        if not isinstance(ch,discord.TextChannel):
+            failed+=1; continue
+        try:
+            msg=await ch.fetch_message(int(x.message_id)); checked+=1
+            if _message_has_custom_id(msg,'v384:skin:edit'):
+                already+=1; continue
+            await msg.edit(embed=skin_embed(x),view=SkinPurchaseView(x))
+            patched+=1
+        except (discord.NotFound,discord.Forbidden,discord.HTTPException) as e:
+            failed+=1
+            print(f'[CATALOG MIGRATION] {x.code} não migrada: {type(e).__name__}: {e}')
+        except Exception as e:
+            failed+=1
+            print(f'[CATALOG MIGRATION] {x.code} erro inesperado: {type(e).__name__}: {e}')
+    if failed==0:
+        set_cfg(guild_id,marker,'1')
+    print(f'[CATALOG MIGRATION] checked={checked} | patched={patched} | já_ok={already} | falhas={failed} | '+('concluída' if failed==0 else 'será retomada no próximo boot'))
+    return failed==0
+
 async def ensure_panel(g,key,view):
     """Create/update a public panel without allowing one bad channel to break startup."""
     ch=channel(g,key)
@@ -1367,6 +1451,9 @@ async def ensure_panel(g,key,view):
         return False, f'faltando: {detail}'
 
     try:
+        # Buylist paused: the canonical public panel must not expose a sell button.
+        if key=='buylist' and not buylist_enabled():
+            view=None
         with Session() as s:
             p=s.get(Panel,(g,key))
         msg=None
@@ -1388,6 +1475,8 @@ async def ensure_panel(g,key,view):
             msg=await ch.send(embed=panel_embed(key),view=view)
             with Session.begin() as s:
                 s.merge(Panel(guild_id=g,panel_key=key,channel_id=ch.id,message_id=msg.id))
+        if key=='buylist' and not buylist_enabled():
+            await cleanup_paused_buylist_legacy_panels(g,msg.id)
         print(f'[PAINEL] {key:<8} #{ch.name} ({ch.id}) OK')
         return True, 'ok'
     except discord.Forbidden as e:
@@ -1508,6 +1597,8 @@ async def on_ready():
                 ok,_=await ensure_panel(g.id,k,v)
                 if not ok: warnings+=1
             if cfg(g.id,'welcome_channel_id') and not await ensure_onboarding_panel(g.id): warnings+=1
+        # One-time legacy catalog migration. It is idempotent and does not run again after success.
+        await migrate_legacy_skin_edit_buttons(g.id)
     for g in bot.guilds:
         access_ok,access_problems,_=customer_access_state(g.id)
         if customer_role(g.id):
