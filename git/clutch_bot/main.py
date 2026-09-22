@@ -67,6 +67,12 @@ def channel(g,key):
 
 PUBLIC_CHANNEL_KEYS=('catalog','buylist','interest','order','feedback','news','sold')
 
+def buylist_enabled():
+    return (os.getenv('BUYLIST_ENABLED','false') or 'false').strip().lower() in ('1','true','yes','on','sim')
+
+def public_channel_keys():
+    return tuple(k for k in PUBLIC_CHANNEL_KEYS if k!='buylist' or buylist_enabled())
+
 def customer_role(guild_id):
     rid=cfg(guild_id,'customer_role_id')
     guild=bot.get_guild(int(guild_id))
@@ -169,7 +175,7 @@ def customer_access_state(guild_id):
     if not guild or not role:
         return False, ['cargo Cliente não configurado/encontrado'], []
     problems=[]; rows=[]
-    targets=[(key,channel(guild_id,key),True) for key in PUBLIC_CHANNEL_KEYS]
+    targets=[(key,channel(guild_id,key),True) for key in public_channel_keys()]
     targets.append(('operations',channel(guild_id,'operations'),False))
     wid=cfg(guild_id,'welcome_channel_id')
     welcome=bot.get_channel(int(wid)) if wid else None
@@ -258,7 +264,7 @@ def log_customer_member_access(guild_id):
     if not members:
         print('[ACCESS MEMBER] nenhum membro real com cargo Cliente encontrado no cache.')
         return
-    targets=[(key,channel(guild_id,key),True) for key in PUBLIC_CHANNEL_KEYS]
+    targets=[(key,channel(guild_id,key),True) for key in public_channel_keys()]
     wid=cfg(guild_id,'welcome_channel_id')
     welcome=bot.get_channel(int(wid)) if wid else None
     targets.append(('onboarding',welcome,True))
@@ -278,6 +284,26 @@ def log_customer_member_access(guild_id):
                 expected_for_member = True
             verdict='OK' if d['effective']==expected_for_member else 'ERRO'
             print(f'[ACCESS MEMBER]   {key} #{ch.name}: {state} [{verdict}] @everyone={d["everyone"]} roles={d["roles"] or ["inherit"]} member={d["member"]} admin={d["administrator"]}')
+
+
+async def apply_buylist_mode(guild_id:int):
+    """Expose the buylist only when enabled. History/data are never deleted."""
+    guild=bot.get_guild(int(guild_id)); role=customer_role(guild_id); ch=channel(guild_id,'buylist')
+    if not guild or not role or not isinstance(ch,discord.TextChannel):
+        return False
+    enabled=buylist_enabled()
+    try:
+        ov=ch.overwrites_for(role)
+        desired=True if enabled else False
+        if ov.view_channel is not desired:
+            ov.view_channel=desired
+            if enabled: ov.read_message_history=True
+            await ch.set_permissions(role,overwrite=ov,reason=f'Clutch OS V3.8.4 - Buylist {"ON" if enabled else "OFF"}')
+        print(f'[BUYLIST MODE] {"ATIVA" if enabled else "PAUSADA"} | Cliente view_channel={desired} | histórico preservado')
+        return True
+    except Exception as exc:
+        print(f'[BUYLIST MODE] falha: {type(exc).__name__}: {exc}')
+        return False
 
 def operation_embed(op):
     colors={'BUYLIST':0xFEE75C,'ORDER':0x5865F2,'SALE':0x57F287,'COUNTER':0xEB459E,'PAYMENT':0x57F287,'MATCH':0x9B59B6,'TRADEIN':0xF1C40F}
@@ -349,6 +375,8 @@ def skin_embed(x):
 class BuyModal(discord.ui.Modal,title='Vender uma skin'):
     skin=discord.ui.TextInput(label='Skin',placeholder='AK-47 | Redline');exterior=discord.ui.TextInput(label='Exterior',placeholder='FN / MW / FT / WW / BS');floatv=discord.ui.TextInput(label='Float',placeholder='0.135');desired=discord.ui.TextInput(label='Valor desejado',placeholder='205,00');extra=discord.ui.TextInput(label='Pattern / stickers / observações',required=False,style=discord.TextStyle.paragraph)
     async def on_submit(self,i):
+        if not buylist_enabled():
+            return await i.response.send_message('⏸️ A compra de skins pela Clutch Club está temporariamente pausada. Você ainda pode **comprar**, **encomendar** ou entrar na **lista de interesse**.',ephemeral=True)
         if not valid_float(self.floatv.value):return await i.response.send_message('❌ Float inválido. Use 0 a 1.',ephemeral=True)
         try:d=D(self.desired.value)
         except:return await i.response.send_message('❌ Valor inválido.',ephemeral=True)
@@ -1093,7 +1121,6 @@ class ClubQuickAccessView(discord.ui.View):
         super().__init__(timeout=300)
         specs=[
             ('🟢 CATÁLOGO','catalog'),
-            ('💰 VENDER','buylist'),
             ('📦 ENCOMENDAR','order'),
             ('🔔 INTERESSE','interest'),
             ('⭐ AVALIAÇÕES','feedback'),
@@ -1134,7 +1161,7 @@ class OnboardingView(discord.ui.View):
             # Entrega atalhos diretos para os canais críticos. Isso evita depender
             # da lista personalizada do Onboarding do Discord para o usuário chegar à Loja.
             links=[]
-            for key in ('catalog','buylist','interest','order','feedback'):
+            for key in ('catalog','interest','order','feedback'):
                 ch=channel(i.guild.id,key)
                 if isinstance(ch,discord.TextChannel):
                     links.append(ch.mention)
@@ -1190,6 +1217,88 @@ def public_base_url():
     domain=(os.getenv('RAILWAY_PUBLIC_DOMAIN') or '').strip().strip('/')
     return f'https://{domain}' if domain else ''
 
+class SkinEditDataModal(discord.ui.Modal,title='Editar skin • Dados'):
+    def __init__(self,skin):
+        super().__init__(); self.skin_id=skin.id
+        self.name=discord.ui.TextInput(label='Nome',default=skin.name,max_length=180)
+        self.exterior=discord.ui.TextInput(label='Exterior',default=skin.exterior or '',required=False,max_length=40)
+        self.floatv=discord.ui.TextInput(label='Float',default=skin.floatv or '',required=False,max_length=32)
+        self.pattern=discord.ui.TextInput(label='Pattern',default=skin.pattern or '',required=False,max_length=32)
+        self.stickers=discord.ui.TextInput(label='Stickers / observações',default=skin.stickers or '',required=False,style=discord.TextStyle.paragraph,max_length=1000)
+        for x in (self.name,self.exterior,self.floatv,self.pattern,self.stickers): self.add_item(x)
+    async def on_submit(self,i):
+        if not staff(i.user): return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
+        if self.floatv.value and not valid_float(self.floatv.value): return await i.response.send_message('❌ Float inválido. Use 0 a 1.',ephemeral=True)
+        with Session.begin() as s:
+            x=s.get(Skin,self.skin_id)
+            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+            if x.status=='RESERVED':return await i.response.send_message('🔒 A skin está reservada. Cancele/finalize a negociação antes de alterar dados críticos.',ephemeral=True)
+            before=f'{x.name}|{x.exterior}|{x.floatv}|{x.pattern}'
+            x.name=self.name.value.strip();x.exterior=self.exterior.value.strip().upper() or None;x.floatv=self.floatv.value.strip().replace(',','.') or None;x.pattern=self.pattern.value.strip() or None;x.stickers=self.stickers.value.strip() or None
+            log(s,gid(i),i.user.id,'SKIN_EDIT_DATA','skin',x.id,before)
+        await refresh_skin(self.skin_id)
+        await i.response.send_message('✅ Dados da skin atualizados no mesmo anúncio.',ephemeral=True)
+
+class SkinEditValuesModal(discord.ui.Modal,title='Editar skin • Valores'):
+    def __init__(self,skin):
+        super().__init__();self.skin_id=skin.id
+        self.price=discord.ui.TextInput(label='Preço de venda',default=str(skin.price or 0),max_length=24)
+        self.cost=discord.ui.TextInput(label='Custo',default=str(skin.cost or 0),max_length=24)
+        self.fees=discord.ui.TextInput(label='Taxas de aquisição',default=str(skin.acquisition_fees or 0),max_length=24)
+        for x in (self.price,self.cost,self.fees):self.add_item(x)
+    async def on_submit(self,i):
+        if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
+        try: price,cost,fees=D(self.price.value),D(self.cost.value),D(self.fees.value)
+        except:return await i.response.send_message('❌ Valor inválido.',ephemeral=True)
+        with Session.begin() as s:
+            x=s.get(Skin,self.skin_id)
+            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+            if x.status=='RESERVED':return await i.response.send_message('🔒 A skin está reservada. Não altere preço/custo durante uma negociação.',ephemeral=True)
+            before=f'price={x.price};cost={x.cost};fees={x.acquisition_fees}'
+            x.price=price;x.cost=cost;x.acquisition_fees=fees;log(s,gid(i),i.user.id,'SKIN_EDIT_VALUES','skin',x.id,before)
+        await refresh_skin(self.skin_id)
+        await i.response.send_message('✅ Valores atualizados no mesmo anúncio.',ephemeral=True)
+
+class SkinEditMediaModal(discord.ui.Modal,title='Editar skin • Mídia e Inspect'):
+    def __init__(self,skin):
+        super().__init__();self.skin_id=skin.id
+        self.inspect=discord.ui.TextInput(label='Inspect link',default=skin.inspect or '',required=False,style=discord.TextStyle.paragraph,max_length=1000)
+        self.image=discord.ui.TextInput(label='URL da imagem',default=skin.image_url or '',required=False,style=discord.TextStyle.paragraph,max_length=1000)
+        self.add_item(self.inspect);self.add_item(self.image)
+    async def on_submit(self,i):
+        if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
+        inspect=self.inspect.value.strip() or None; image=self.image.value.strip() or None
+        if inspect and not inspect.startswith('steam://run/730//+csgo_econ_action_preview'):
+            return await i.response.send_message('❌ Inspect inválido. Use o link steam://run/730//+csgo_econ_action_preview...',ephemeral=True)
+        if image and not image.startswith(('http://','https://')):
+            return await i.response.send_message('❌ A imagem precisa ser uma URL http/https.',ephemeral=True)
+        with Session.begin() as s:
+            x=s.get(Skin,self.skin_id)
+            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+            x.inspect=inspect;x.image_url=image;log(s,gid(i),i.user.id,'SKIN_EDIT_MEDIA','skin',x.id,'inspect/image')
+        await refresh_skin(self.skin_id)
+        await i.response.send_message('✅ Imagem/Inspect atualizados no mesmo anúncio.',ephemeral=True)
+
+class SkinEditMenuView(discord.ui.View):
+    def __init__(self,skin_id:int):super().__init__(timeout=180);self.skin_id=skin_id
+    def get_skin(self):
+        with Session() as s:return s.get(Skin,self.skin_id)
+    @discord.ui.button(label='DADOS',emoji='📝',style=discord.ButtonStyle.secondary)
+    async def data(self,i,b):
+        x=self.get_skin();
+        if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+        await i.response.send_modal(SkinEditDataModal(x))
+    @discord.ui.button(label='VALORES',emoji='💰',style=discord.ButtonStyle.secondary)
+    async def values(self,i,b):
+        x=self.get_skin();
+        if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+        await i.response.send_modal(SkinEditValuesModal(x))
+    @discord.ui.button(label='IMAGEM / INSPECT',emoji='🖼️',style=discord.ButtonStyle.secondary)
+    async def media(self,i,b):
+        x=self.get_skin();
+        if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+        await i.response.send_modal(SkinEditMediaModal(x))
+
 class SkinPurchaseView(discord.ui.View):
     def __init__(self, skin=None):
         super().__init__(timeout=None)
@@ -1198,6 +1307,15 @@ class SkinPurchaseView(discord.ui.View):
             base=public_base_url()
             if base:
                 self.add_item(discord.ui.Button(label='INSPECIONAR NO CS2',emoji='🎮',style=discord.ButtonStyle.link,url=f'{base}/inspect/{skin.code}'))
+    @discord.ui.button(label='EDITAR SKIN',emoji='✏️',style=discord.ButtonStyle.secondary,custom_id='v384:skin:edit')
+    async def edit_skin(self,i,b):
+        if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
+        code=_code_from_interaction_message(i,'SK')
+        if not code:return await i.response.send_message('❌ Não consegui identificar a skin deste anúncio.',ephemeral=True)
+        with Session() as s:x=s.scalar(select(Skin).where(Skin.guild_id==gid(i),Skin.code==code))
+        if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+        await i.response.send_message(f'✏️ **Editar {x.code} • {x.name}**\nEscolha o grupo de dados que deseja alterar. O mesmo anúncio será atualizado.',view=SkinEditMenuView(x.id),ephemeral=True)
+
     @discord.ui.button(label='COMPRAR',emoji='🛒',style=discord.ButtonStyle.success,custom_id='v370:skin:buy')
     async def buy(self,i,b):
         code=_code_from_interaction_message(i,'SK')
@@ -1213,7 +1331,10 @@ class SkinPurchaseView(discord.ui.View):
 class PublicPanel(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
     @discord.ui.button(label='QUERO VENDER UMA SKIN',emoji='💰',style=discord.ButtonStyle.success,custom_id='v2:buy:new')
-    async def buy(self,i,b):await i.response.send_modal(BuyModal())
+    async def buy(self,i,b):
+        if not buylist_enabled():
+            return await i.response.send_message('⏸️ **Buylist temporariamente pausada.** No momento a Clutch Club não está comprando skins diretamente. Você ainda pode comprar, encomendar ou cadastrar interesse.',ephemeral=True)
+        await i.response.send_modal(BuyModal())
 class CatalogPanel(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
     @discord.ui.button(label='COMPRAR / RESERVAR',emoji='🛒',style=discord.ButtonStyle.success,custom_id='v2:catalog:reserve')
@@ -1227,7 +1348,7 @@ class OrderPanel(discord.ui.View):
     @discord.ui.button(label='QUERO ENCOMENDAR',emoji='📬',style=discord.ButtonStyle.primary,custom_id='v2:order:new')
     async def go(self,i,b):await i.response.send_modal(OrderModal())
 def panel_embed(k):
-    data={'buylist':('💰 VENDA SUA SKIN PARA A CLUTCH CLUB','Envie sua skin para análise e receba uma proposta da nossa equipe. Clique abaixo para começar — nenhum /comando é necessário.'),'catalog':('🛒 CATÁLOGO CLUTCH CLUB','Veja as skins disponíveis e use o código SK-XXXXX para comprar ou reservar.'),'interest':('🔔 LISTA DE INTERESSE','Procurando uma skin específica? Cadastre seu interesse e avisaremos quando houver um match.'),'order':('📦 ENCOMENDE SUA SKIN','Não encontrou o que procura? Abra uma encomenda informando skin, exterior, float e orçamento.')};t,d=data[k];return discord.Embed(title=t,description=d,color=0x2B2D31)
+    data={'buylist':(('⏸️ BUYLIST TEMPORARIAMENTE PAUSADA','No momento a Clutch Club não está comprando skins diretamente. O histórico permanece preservado e o serviço poderá ser reativado pela equipe.') if not buylist_enabled() else ('💰 VENDA SUA SKIN PARA A CLUTCH CLUB','Envie sua skin para análise e receba uma proposta da nossa equipe. Clique abaixo para começar — nenhum /comando é necessário.')),'catalog':('🛒 CATÁLOGO CLUTCH CLUB','Veja as skins disponíveis e use o código SK-XXXXX para comprar ou reservar.'),'interest':('🔔 LISTA DE INTERESSE','Procurando uma skin específica? Cadastre seu interesse e avisaremos quando houver um match.'),'order':('📦 ENCOMENDE SUA SKIN','Não encontrou o que procura? Abra uma encomenda informando skin, exterior, float e orçamento.')};t,d=data[k];return discord.Embed(title=t,description=d,color=0x2B2D31)
 async def ensure_panel(g,key,view):
     """Create/update a public panel without allowing one bad channel to break startup."""
     ch=channel(g,key)
@@ -1342,10 +1463,8 @@ async def on_ready():
         # V3.7.3: reaplica o botão COMPRAR nos anúncios já existentes do catálogo.
         try:
             with Session() as s:
-                catalog_skin_ids=[x.id for x in s.scalars(select(Skin).where(Skin.status.in_(['AVAILABLE','RESERVED']))).all() if x.channel_id and x.message_id]
-            for skin_id in catalog_skin_ids:
-                await refresh_skin(skin_id)
-            print(f'[CATALOG] Botão COMPRAR sincronizado em {len(catalog_skin_ids)} anúncio(s) existente(s).')
+                catalog_count=len([x.id for x in s.scalars(select(Skin).where(Skin.status.in_(['AVAILABLE','RESERVED']))).all() if x.channel_id and x.message_id])
+            print(f'[CATALOG] {catalog_count} anúncio(s) existente(s); PATCH em massa no boot desativado (V3.8.4).')
         except Exception as e:
             print(f'[CATALOG] Aviso ao sincronizar botões de compra: {type(e).__name__}: {e}')
         if not housekeeping.is_running():
@@ -1382,6 +1501,7 @@ async def on_ready():
         _startup_done=True
     warnings=0
     for g in bot.guilds:
+        if not await apply_buylist_mode(g.id): warnings+=1
         if AUTO_PUBLISH:
             for k,v in [('buylist',PublicPanel()),('catalog',CatalogPanel()),('interest',InterestPanel()),('order',OrderPanel())]:
                 ok,_=await ensure_panel(g.id,k,v)
@@ -1391,7 +1511,7 @@ async def on_ready():
         access_ok,access_problems,_=customer_access_state(g.id)
         if customer_role(g.id):
             if access_ok:
-                public_count=sum(1 for k in PUBLIC_CHANNEL_KEYS if isinstance(channel(g.id,k),discord.TextChannel))
+                public_count=sum(1 for k in public_channel_keys() if isinstance(channel(g.id,k),discord.TextChannel))
                 print(f'[ACCESS] Cliente: {public_count} públicos OK | Operations privado OK | Onboarding OK')
             else:
                 print('[ACCESS] AVISO: '+' | '.join(access_problems))
