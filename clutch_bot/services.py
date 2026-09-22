@@ -15,10 +15,21 @@ def cfg(g,key,default=None):
     with Session() as s:r=s.get(GuildConfig,(g,key));return r.value if r else default
 def set_cfg(g,key,value):
     with Session.begin() as s:s.merge(GuildConfig(guild_id=g,key=key,value=str(value)))
+
+def next_skin_code(s, guild):
+    """Return the next sequential public SK code, independent from the DB primary key."""
+    rows=s.scalars(select(Skin.code).where(Skin.guild_id==guild, Skin.code.like('SK-%'))).all()
+    nums=[]
+    for code in rows:
+        try:
+            if code and code.startswith('SK-') and code[3:].isdigit(): nums.append(int(code[3:]))
+        except Exception: pass
+    return f'SK-{(max(nums) if nums else 0)+1:05d}'
+
 def create_skin(guild,name,exterior,floatv,pattern,stickers,price,cost=0,inspect=None,source='MANUAL',source_ref=None,fees=0):
     if not valid_float(floatv):raise ValueError('Float deve estar entre 0 e 1.')
     with Session.begin() as s:
-        x=Skin(code='PENDING',guild_id=guild,name=name,exterior=exterior.upper(),floatv=str(floatv).replace(',','.'),pattern=pattern,stickers=stickers,price=D(price),cost=D(cost),acquisition_fees=D(fees),inspect=inspect,source=source,source_ref=source_ref);s.add(x);s.flush();x.code=f'SK-{x.id:05d}'
+        x=Skin(code='PENDING',guild_id=guild,name=name,exterior=exterior.upper(),floatv=str(floatv).replace(',','.'),pattern=pattern,stickers=stickers,price=D(price),cost=D(cost),acquisition_fees=D(fees),inspect=inspect,source=source,source_ref=source_ref);s.add(x);s.flush();x.code=next_skin_code(s,guild)
         if D(cost):s.add(Ledger(guild_id=guild,skin_id=x.id,kind='ACQUISITION',amount=-D(cost),note=source))
         if D(fees):s.add(Ledger(guild_id=guild,skin_id=x.id,kind='ACQUISITION_FEE',amount=-D(fees),note=source))
         return x

@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, Response, RedirectResponse, JSONResp
 from sqlalchemy import select, func
 from clutch_bot.db import init_db, Session
 from clutch_bot.models import Skin, Buylist, Sale, Order, Feedback, Audit, Operation, Negotiation, NegotiationOrder, TradeInItem, NegotiationPayment, Ledger
+from clutch_bot.services import next_skin_code
 from clutch_os.core.models_ext import Customer
 from clutch_os.core.engine import wallet, analyze_purchase
 
@@ -443,7 +444,7 @@ def tradein_transition(guild_id:int,code:str,item_code:str,payload:dict=Body(...
         if nxt=='ACCEPTED':
             if t.stock_skin_id: raise HTTPException(409,'Este Trade-In já possui SK vinculada')
             sk=Skin(code='PENDING',guild_id=guild_id,name=t.name,exterior=t.exterior,floatv=t.floatv,pattern=t.pattern,status='AVAILABLE',cost=t.credit_value,acquisition_fees=0,price=0,source='TRADE_IN',source_ref=f'{n.code}/{t.code}')
-            s.add(sk);s.flush();sk.code=f'SK-{sk.id:05d}';t.stock_skin_id=sk.id
+            s.add(sk);s.flush();sk.code=next_skin_code(s,int(guild_id));t.stock_skin_id=sk.id
             s.add(Audit(guild_id=guild_id,actor_id=0,action='TRADEIN_TO_STOCK',entity_type='skin',entity_id=sk.id,detail=f'{n.code}/{t.code} -> {sk.code}'))
         t.status=nxt
         s.add(Audit(guild_id=guild_id,actor_id=0,action=f'TRADEIN_{nxt}',entity_type='tradein_item',entity_id=t.id,detail=f'{n.code}/{t.code}'))

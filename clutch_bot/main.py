@@ -5,6 +5,7 @@ from sqlalchemy import select
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 import os
+import asyncio
 
 def utc_aware(dt):
     """Normalize SQLite/SQLAlchemy datetimes to timezone-aware UTC."""
@@ -294,7 +295,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.3 — LEGACY UI MIGRATION')
+    print('[VERSION] CLUTCH OS V3.8.4.4 — SK NORMALIZATION')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -970,7 +971,7 @@ class BuylistStockModal(discord.ui.Modal,title='Adicionar skin ao estoque'):
             b=s.scalar(select(Buylist).where(Buylist.guild_id==gid(i),Buylist.code==self.code).with_for_update())
             if not b:return await i.followup.send('❌ Buylist não encontrada.',ephemeral=True)
             if b.status!='PAID':return await i.followup.send(f'❌ A Buylist precisa estar em PAID. Estado atual: {b.status}.',ephemeral=True)
-            x=Skin(code='PENDING',guild_id=gid(i),name=b.skin_name,exterior=b.exterior,floatv=b.floatv,pattern=b.pattern,stickers=b.stickers,status='AVAILABLE',cost=b.proposal or b.counterproposal or b.desired_price or 0,acquisition_fees=fees,price=price,source='BUYLIST',source_ref=b.code);s.add(x);s.flush();x.code=f'SK-{x.id:05d}';b.stock_skin_id=x.id;b.status='COMPLETED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION',amount=-x.cost,note=b.code))
+            x=Skin(code='PENDING',guild_id=gid(i),name=b.skin_name,exterior=b.exterior,floatv=b.floatv,pattern=b.pattern,stickers=b.stickers,status='AVAILABLE',cost=b.proposal or b.counterproposal or b.desired_price or 0,acquisition_fees=fees,price=price,source='BUYLIST',source_ref=b.code);s.add(x);s.flush();x.code=next_skin_code(s,gid(i));b.stock_skin_id=x.id;b.status='COMPLETED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION',amount=-x.cost,note=b.code))
             if fees:s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION_FEE',amount=-fees,note=b.code))
             log(s,gid(i),i.user.id,'BUYLIST_STOCK','buylist',b.id,x.code);sid=x.id
         with Session() as s:x=s.get(Skin,sid)
@@ -1398,6 +1399,72 @@ async def cleanup_paused_buylist_legacy_panels(guild_id:int, canonical_message_i
         print(f'[BUYLIST UI] {removed} painel(is) legado(s) removido(s); painel pausado canônico preservado.')
     return removed
 
+async def normalize_skin_codes_v3844(guild_id:int):
+    """One-shot normalization of the seven confirmed real inventory SK codes.
+
+    Keeps immutable DB primary keys and every FK relationship intact. Test/residual
+    rows are archived under TEST-* codes, then the seven valid rows are compacted
+    to SK-00001..SK-00007. Discord catalog messages keep their original message_id.
+    """
+    marker='v3844_skin_codes_normalized'
+    if cfg(guild_id,marker)=='1':
+        print('[SK NORMALIZATION] já concluída; nenhuma alteração necessária.')
+        return True
+    mapping={
+        'SK-00002':'SK-00001','SK-00003':'SK-00002','SK-00004':'SK-00003',
+        'SK-00005':'SK-00004','SK-00007':'SK-00005','SK-00008':'SK-00006',
+        'SK-00009':'SK-00007',
+    }
+    residual={'SK-00001','SK-00006','SK-00010'}
+    changed=[]
+    try:
+        with Session.begin() as s:
+            rows=list(s.scalars(select(Skin).where(Skin.guild_id==guild_id)).all())
+            by_code={x.code:x for x in rows}
+            missing=[c for c in mapping if c not in by_code]
+            if missing:
+                print('[SK NORMALIZATION] ABORTADA: códigos válidos ausentes: '+', '.join(missing))
+                return False
+            # Free destination codes without deleting historical/test rows.
+            for old in residual:
+                x=by_code.get(old)
+                if x:
+                    x.code=f'TEST-{old}'
+                    x.status='TEST_ARCHIVED'
+                    x.reserved_by=None; x.reserved_until=None
+            # Temporary names avoid UNIQUE collisions while shifting the sequence.
+            for old in mapping:
+                x=by_code[old]; x.code=f'TMP-{x.id}'
+            s.flush()
+            for old,new in mapping.items():
+                x=by_code[old]; x.code=new; changed.append((x.id,old,new,x.channel_id,x.message_id))
+            s.merge(GuildConfig(guild_id=guild_id,key=marker,value='1'))
+            s.add(Audit(guild_id=guild_id,actor_id=0,action='SK_NORMALIZATION_V3844',entity_type='skin',entity_id=None,detail='; '.join(f'{a}->{b}' for _,a,b,_,_ in changed)+'; NEXT=SK-00008'))
+        print('[SK NORMALIZATION] banco OK | '+ ' | '.join(f'{a}->{b}' for _,a,b,_,_ in changed) +' | próximo=SK-00008')
+    except Exception as e:
+        print(f'[SK NORMALIZATION] FALHA; transação revertida: {type(e).__name__}: {e}')
+        return False
+    # Refresh only the seven affected catalog messages; never mass-patch the catalog.
+    patched=missing_msg=failed=0
+    for skin_id,old,new,chid,mid in changed:
+        if not chid or not mid: continue
+        ch=bot.get_channel(int(chid))
+        if not isinstance(ch,discord.TextChannel): failed+=1; continue
+        try:
+            with Session() as s: x=s.get(Skin,skin_id)
+            msg=await ch.fetch_message(int(mid))
+            await msg.edit(embed=skin_embed(x),view=SkinPurchaseView(x) if x.status=='AVAILABLE' else None)
+            patched+=1
+            await asyncio.sleep(1.0)
+        except discord.NotFound:
+            missing_msg+=1
+            print(f'[SK NORMALIZATION] {new}: anúncio antigo não existe; DB normalizado e message_id preservado para diagnóstico.')
+        except Exception as e:
+            failed+=1
+            print(f'[SK NORMALIZATION] {new}: falha ao atualizar anúncio: {type(e).__name__}: {e}')
+    print(f'[SK NORMALIZATION] Discord patched={patched} | mensagens_ausentes={missing_msg} | falhas={failed}')
+    return True
+
 async def migrate_legacy_skin_edit_buttons(guild_id:int):
     """V3.8.4.3 one-shot migration for catalog ads created before EDITAR SKIN.
 
@@ -1597,7 +1664,8 @@ async def on_ready():
                 ok,_=await ensure_panel(g.id,k,v)
                 if not ok: warnings+=1
             if cfg(g.id,'welcome_channel_id') and not await ensure_onboarding_panel(g.id): warnings+=1
-        # One-time legacy catalog migration. It is idempotent and does not run again after success.
+        # One-time SK normalization, then legacy catalog UI migration.
+        await normalize_skin_codes_v3844(g.id)
         await migrate_legacy_skin_edit_buttons(g.id)
     for g in bot.guilds:
         access_ok,access_problems,_=customer_access_state(g.id)
@@ -1791,7 +1859,7 @@ async def buylist_etapa(i:discord.Interaction,codigo:str,etapa:app_commands.Choi
         allowed={'ACCEPTED':['RECEIVED','REJECTED'],'RECEIVED':['PAID','REJECTED'],'PAID':['STOCK'],'PENDING':['REJECTED'],'COUNTERED':['REJECTED'],'PROPOSED':['REJECTED']}
         if etapa.value not in allowed.get(b.status,[]):return await i.response.send_message(f'Etapa inválida: {b.status} → {etapa.value}',ephemeral=True)
         if etapa.value=='STOCK':
-            x=Skin(code='PENDING',guild_id=gid(i),name=b.skin_name,exterior=b.exterior,floatv=b.floatv,pattern=b.pattern,stickers=b.stickers,status='AVAILABLE',cost=b.proposal or b.counterproposal or b.desired_price or 0,acquisition_fees=D(taxas),price=D(preco_venda),source='BUYLIST',source_ref=b.code);s.add(x);s.flush();x.code=f'SK-{x.id:05d}';b.stock_skin_id=x.id;b.status='COMPLETED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION',amount=-x.cost,note=b.code));
+            x=Skin(code='PENDING',guild_id=gid(i),name=b.skin_name,exterior=b.exterior,floatv=b.floatv,pattern=b.pattern,stickers=b.stickers,status='AVAILABLE',cost=b.proposal or b.counterproposal or b.desired_price or 0,acquisition_fees=D(taxas),price=D(preco_venda),source='BUYLIST',source_ref=b.code);s.add(x);s.flush();x.code=next_skin_code(s,gid(i));b.stock_skin_id=x.id;b.status='COMPLETED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION',amount=-x.cost,note=b.code));
             if D(taxas):s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='ACQUISITION_FEE',amount=-D(taxas),note=b.code))
             log(s,gid(i),i.user.id,'BUYLIST_STOCK','buylist',b.id,x.code);sid=x.id
         else:b.status=etapa.value;log(s,gid(i),i.user.id,'BUYLIST_STATUS','buylist',b.id,etapa.value);sid=None
@@ -1926,7 +1994,7 @@ async def tradein_receber(i:discord.Interaction,item:str,preco_venda:str):
         if not t or t.status!='EXPECTED':return await i.response.send_message('❌ Item não encontrado ou já recebido.',ephemeral=True)
         n=s.get(Negotiation,t.negotiation_id)
         if n.guild_id!=gid(i):return await i.response.send_message('❌ Item não pertence a este servidor.',ephemeral=True)
-        x=Skin(code='PENDING',guild_id=gid(i),name=t.name,exterior=t.exterior,floatv=t.floatv,pattern=t.pattern,status='AVAILABLE',cost=t.credit_value,acquisition_fees=0,price=pv,source='TRADE_IN',source_ref=n.code);s.add(x);s.flush();x.code=f'SK-{x.id:05d}';t.stock_skin_id=x.id;t.status='RECEIVED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='TRADE_IN_ASSET',amount=0,note=f'{n.code} • custo-base {t.credit_value}'));log(s,gid(i),i.user.id,'TRADEIN_RECEIVED','skin',x.id,f'{t.code} -> {x.code}');sid=x.id;scode=x.code
+        x=Skin(code='PENDING',guild_id=gid(i),name=t.name,exterior=t.exterior,floatv=t.floatv,pattern=t.pattern,status='AVAILABLE',cost=t.credit_value,acquisition_fees=0,price=pv,source='TRADE_IN',source_ref=n.code);s.add(x);s.flush();x.code=next_skin_code(s,gid(i));t.stock_skin_id=x.id;t.status='RECEIVED';s.add(Ledger(guild_id=gid(i),skin_id=x.id,kind='TRADE_IN_ASSET',amount=0,note=f'{n.code} • custo-base {t.credit_value}'));log(s,gid(i),i.user.id,'TRADEIN_RECEIVED','skin',x.id,f'{t.code} -> {x.code}');sid=x.id;scode=x.code
     with Session() as s:x=s.get(Skin,sid)
     ch=channel(gid(i),'catalog')
     if isinstance(ch,discord.TextChannel):
