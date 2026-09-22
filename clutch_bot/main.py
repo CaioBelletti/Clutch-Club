@@ -295,7 +295,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.4 — SK NORMALIZATION')
+    print('[VERSION] CLUTCH OS V3.8.4.5 — INTERACTION STABILITY')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -1228,15 +1228,16 @@ class SkinEditDataModal(discord.ui.Modal,title='Editar skin • Dados'):
     async def on_submit(self,i):
         if not staff(i.user): return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
         if self.floatv.value and not valid_float(self.floatv.value): return await i.response.send_message('❌ Float inválido. Use 0 a 1.',ephemeral=True)
+        await i.response.defer(ephemeral=True)
         with Session.begin() as s:
             x=s.get(Skin,self.skin_id)
-            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
-            if x.status=='RESERVED':return await i.response.send_message('🔒 A skin está reservada. Cancele/finalize a negociação antes de alterar dados críticos.',ephemeral=True)
+            if not x:return await i.followup.send('❌ Skin não encontrada.',ephemeral=True)
+            if x.status=='RESERVED':return await i.followup.send('🔒 A skin está reservada. Cancele/finalize a negociação antes de alterar dados críticos.',ephemeral=True)
             before=f'{x.name}|{x.exterior}|{x.floatv}|{x.pattern}'
             x.name=self.name.value.strip();x.exterior=self.exterior.value.strip().upper() or None;x.floatv=self.floatv.value.strip().replace(',','.') or None;x.pattern=self.pattern.value.strip() or None;x.stickers=self.stickers.value.strip() or None
             log(s,gid(i),i.user.id,'SKIN_EDIT_DATA','skin',x.id,before)
         await refresh_skin(self.skin_id)
-        await i.response.send_message('✅ Dados da skin atualizados no mesmo anúncio.',ephemeral=True)
+        await i.followup.send('✅ Dados da skin atualizados no mesmo anúncio.',ephemeral=True)
 
 class SkinEditValuesModal(discord.ui.Modal,title='Editar skin • Valores'):
     def __init__(self,skin):
@@ -1249,14 +1250,15 @@ class SkinEditValuesModal(discord.ui.Modal,title='Editar skin • Valores'):
         if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode editar skins.',ephemeral=True)
         try: price,cost,fees=D(self.price.value),D(self.cost.value),D(self.fees.value)
         except:return await i.response.send_message('❌ Valor inválido.',ephemeral=True)
+        await i.response.defer(ephemeral=True)
         with Session.begin() as s:
             x=s.get(Skin,self.skin_id)
-            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
-            if x.status=='RESERVED':return await i.response.send_message('🔒 A skin está reservada. Não altere preço/custo durante uma negociação.',ephemeral=True)
+            if not x:return await i.followup.send('❌ Skin não encontrada.',ephemeral=True)
+            if x.status=='RESERVED':return await i.followup.send('🔒 A skin está reservada. Não altere preço/custo durante uma negociação.',ephemeral=True)
             before=f'price={x.price};cost={x.cost};fees={x.acquisition_fees}'
             x.price=price;x.cost=cost;x.acquisition_fees=fees;log(s,gid(i),i.user.id,'SKIN_EDIT_VALUES','skin',x.id,before)
         await refresh_skin(self.skin_id)
-        await i.response.send_message('✅ Valores atualizados no mesmo anúncio.',ephemeral=True)
+        await i.followup.send('✅ Valores atualizados no mesmo anúncio.',ephemeral=True)
 
 class SkinEditMediaModal(discord.ui.Modal,title='Editar skin • Mídia e Inspect'):
     def __init__(self,skin):
@@ -1271,12 +1273,13 @@ class SkinEditMediaModal(discord.ui.Modal,title='Editar skin • Mídia e Inspec
             return await i.response.send_message('❌ Inspect inválido. Use o link steam://run/730//+csgo_econ_action_preview...',ephemeral=True)
         if image and not image.startswith(('http://','https://')):
             return await i.response.send_message('❌ A imagem precisa ser uma URL http/https.',ephemeral=True)
+        await i.response.defer(ephemeral=True)
         with Session.begin() as s:
             x=s.get(Skin,self.skin_id)
-            if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+            if not x:return await i.followup.send('❌ Skin não encontrada.',ephemeral=True)
             x.inspect=inspect;x.image_url=image;log(s,gid(i),i.user.id,'SKIN_EDIT_MEDIA','skin',x.id,'inspect/image')
         await refresh_skin(self.skin_id)
-        await i.response.send_message('✅ Imagem/Inspect atualizados no mesmo anúncio.',ephemeral=True)
+        await i.followup.send('✅ Imagem/Inspect atualizados no mesmo anúncio.',ephemeral=True)
 
 class SkinEditMenuView(discord.ui.View):
     def __init__(self,skin_id:int):super().__init__(timeout=180);self.skin_id=skin_id
