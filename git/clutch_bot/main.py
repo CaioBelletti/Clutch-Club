@@ -1042,18 +1042,46 @@ class OnboardingView(discord.ui.View):
         role=i.guild.get_role(int(role_id))
         if not role:
             return await i.response.send_message('❌ O cargo configurado não existe mais. Avise a equipe.',ephemeral=True)
-        if role in i.user.roles:
-            return await i.response.send_message('👑 Você já faz parte do Club. Bem-vindo!',ephemeral=True)
         me=i.guild.me
         if not me or not me.guild_permissions.manage_roles or role>=me.top_role:
             return await i.response.send_message('❌ Não consigo liberar seu acesso: o cargo do Clutch Bot precisa ficar acima do cargo de Cliente e ter **Gerenciar Cargos**.',ephemeral=True)
         try:
-            await i.user.add_roles(role,reason='Clutch Club onboarding concluído')
+            # V3.8.1: o botão é a autoridade do acesso. Mesmo quem já possui
+            # o cargo Cliente passa pela verificação/reparo da matriz de canais.
+            already_member = role in i.user.roles
+            if not already_member:
+                await i.user.add_roles(role,reason='Clutch Club onboarding concluído')
+
+            access_ok, access_details = await repair_customer_access(i.guild.id)
+
             with Session.begin() as s:
-                log(s,i.guild.id,i.user.id,'ONBOARDING_COMPLETE','member',None,f'role={role.id}')
-            await i.response.send_message('👑 **Bem-vindo ao Club!** Seu acesso foi liberado. Agora você já pode acessar a Loja e a Comunidade.',ephemeral=True)
+                detail=f'role={role.id}; already_member={already_member}; access_ok={access_ok}'
+                log(s,i.guild.id,i.user.id,'ONBOARDING_COMPLETE','member',None,detail)
+
+            # Entrega atalhos diretos para os canais críticos. Isso evita depender
+            # da lista personalizada do Onboarding do Discord para o usuário chegar à Loja.
+            links=[]
+            for key in ('catalog','buylist','interest','order','feedback'):
+                ch=channel(i.guild.id,key)
+                if isinstance(ch,discord.TextChannel):
+                    links.append(ch.mention)
+            channels_text=' • '.join(links)
+
+            if access_ok:
+                msg='👑 **Bem-vindo ao Club!** Seu cargo **Cliente** e o acesso aos canais da Loja e da Comunidade foram verificados.'
+                if channels_text:
+                    msg += f'\n\n🛒 **Acessos rápidos:** {channels_text}'
+                if already_member:
+                    msg += '\n\n🔄 Você já era Cliente; o Clutch OS reconferiu seu acesso.'
+                await i.response.send_message(msg,ephemeral=True)
+            else:
+                print(f'[ONBOARDING ACCESS] falha para {i.user} ({i.user.id}): {access_details}')
+                await i.response.send_message('⚠️ Seu cargo **Cliente** foi aplicado, mas o Clutch OS encontrou uma divergência ao validar os canais. A equipe foi informada para corrigir o acesso.',ephemeral=True)
         except discord.Forbidden:
-            await i.response.send_message('❌ O Discord bloqueou a atribuição do cargo. Confira a hierarquia/permissão do Clutch Bot.',ephemeral=True)
+            await i.response.send_message('❌ O Discord bloqueou a atribuição do cargo/acesso. Confira a hierarquia e as permissões do Clutch Bot.',ephemeral=True)
+        except discord.HTTPException as exc:
+            print(f'[ONBOARDING ACCESS] HTTP error para {i.user} ({i.user.id}): {exc}')
+            await i.response.send_message('❌ O Discord recusou a atualização do acesso neste momento. Tente novamente em alguns segundos.',ephemeral=True)
 
 def onboarding_embed():
     e=discord.Embed(title='👑 BEM-VINDO À CLUTCH CLUB',description='Compra, venda, encomenda e comunidade de skins de CS2.\n\nAntes de começar:\n📜 Confira **Como Funciona**\n🛡️ Leia nossas orientações de **Segurança**\n🤝 Negocie somente pelos canais oficiais\n\nQuando estiver pronto, clique abaixo para liberar seu acesso.',color=0xF1C40F)
