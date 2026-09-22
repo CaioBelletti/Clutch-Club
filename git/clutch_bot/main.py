@@ -222,6 +222,59 @@ async def repair_customer_access(guild_id):
         if item not in details: details.append(item)
     return False,details
 
+def _overwrite_view_value(overwrite):
+    """Return an explicit view_channel overwrite as ALLOW/DENY/inherit."""
+    value=overwrite.view_channel
+    if value is True: return 'ALLOW'
+    if value is False: return 'DENY'
+    return 'inherit'
+
+def member_access_details(member:discord.Member, ch:discord.TextChannel):
+    """Read effective member access and the view_channel overwrite chain. Diagnostic only."""
+    effective=bool(ch.permissions_for(member).view_channel)
+    everyone=ch.overwrites_for(ch.guild.default_role)
+    role_rows=[]
+    for role in member.roles:
+        if role.is_default():
+            continue
+        ov=ch.overwrites_for(role)
+        if ov.view_channel is not None:
+            role_rows.append(f'{role.name}={_overwrite_view_value(ov)}')
+    member_ov=ch.overwrites_for(member)
+    return {
+        'effective': effective,
+        'everyone': _overwrite_view_value(everyone),
+        'roles': role_rows,
+        'member': _overwrite_view_value(member_ov),
+        'administrator': bool(member.guild_permissions.administrator),
+    }
+
+def log_customer_member_access(guild_id):
+    """V3.8.2: log effective access for every real member carrying the Cliente role. No writes."""
+    guild=bot.get_guild(int(guild_id)); role=customer_role(guild_id)
+    if not guild or not role:
+        return
+    members=[m for m in guild.members if not m.bot and role in m.roles]
+    if not members:
+        print('[ACCESS MEMBER] nenhum membro real com cargo Cliente encontrado no cache.')
+        return
+    targets=[(key,channel(guild_id,key),True) for key in PUBLIC_CHANNEL_KEYS]
+    wid=cfg(guild_id,'welcome_channel_id')
+    welcome=bot.get_channel(int(wid)) if wid else None
+    targets.append(('onboarding',welcome,True))
+    targets.append(('operations',channel(guild_id,'operations'),False))
+    for member in members:
+        print(f'[ACCESS MEMBER] {member} ({member.id}) roles={[r.name for r in member.roles if not r.is_default()]}')
+        seen=set()
+        for key,ch,expected in targets:
+            if not isinstance(ch,discord.TextChannel) or ch.id in seen:
+                continue
+            seen.add(ch.id)
+            d=member_access_details(member,ch)
+            state='VÊ' if d['effective'] else 'NÃO VÊ'
+            verdict='OK' if d['effective']==expected else 'ERRO'
+            print(f'[ACCESS MEMBER]   {key} #{ch.name}: {state} [{verdict}] @everyone={d["everyone"]} roles={d["roles"] or ["inherit"]} member={d["member"]} admin={d["administrator"]}')
+
 def operation_embed(op):
     colors={'BUYLIST':0xFEE75C,'ORDER':0x5865F2,'SALE':0x57F287,'COUNTER':0xEB459E,'PAYMENT':0x57F287,'MATCH':0x9B59B6,'TRADEIN':0xF1C40F}
     e=discord.Embed(title=f'📟 {op.title}',description=op.detail or 'Pendência operacional',color=colors.get(op.kind,0x2B2D31))
@@ -1322,6 +1375,8 @@ async def on_ready():
                 print(f'[ACCESS] Cliente: {public_count} públicos OK | Operations privado OK | Onboarding OK')
             else:
                 print('[ACCESS] AVISO: '+' | '.join(access_problems))
+    for g in bot.guilds:
+        log_customer_member_access(g.id)
     print(f'[CLUTCH] Inicialização concluída com {warnings} aviso(s). Bot permanece online.')
 
 @bot.tree.command(name='configurar-onboarding',description='Configura o canal de entrada e o cargo liberado pelo onboarding')
@@ -1413,6 +1468,31 @@ async def diagnostico(i:discord.Interaction):
             can_view=wch.permissions_for(role).view_channel
             lines.append(f'{"✅" if can_view else "❌"} Boas-vindas: Cliente **{"VÊ" if can_view else "NÃO VÊ"}** {wch.mention}')
     lines.append('\nℹ️ O aviso de Message Content Intent não causa o erro 403; os fluxos atuais usam slash commands, botões e modais.')
+    await i.followup.send('\n'.join(lines),ephemeral=True)
+
+@bot.tree.command(name='diagnostico-membro',description='Verifica o acesso efetivo de um membro Cliente aos canais')
+@app_commands.checks.has_permissions(administrator=True)
+async def diagnostico_membro(i:discord.Interaction,membro:discord.Member):
+    await i.response.defer(ephemeral=True)
+    lines=[f'🧪 **ACESSO EFETIVO — {membro.display_name}**',f'ID: `{membro.id}`']
+    lines.append('Cargos: '+(', '.join(r.mention for r in membro.roles if not r.is_default()) or 'nenhum'))
+    targets=[('Catálogo','catalog',True),('Buylist','buylist',True),('Lista de interesse','interest',True),('Encomendas','order',True),('Avaliações','feedback',True),('Novidades','news',True),('Skins vendidas','sold',True),('Operations Center','operations',False)]
+    wid=cfg(gid(i),'welcome_channel_id'); welcome=bot.get_channel(int(wid)) if wid else None
+    if isinstance(welcome,discord.TextChannel):
+        targets.append(('Boas-vindas',None,True))
+    for label,key,expected in targets:
+        ch=welcome if key is None else channel(gid(i),key)
+        if not isinstance(ch,discord.TextChannel):
+            lines.append(f'⚪ {label}: não configurado/canal não encontrado')
+            continue
+        d=member_access_details(membro,ch)
+        good=d['effective']==expected
+        state='VÊ' if d['effective'] else 'NÃO VÊ'
+        lines.append(f'{"✅" if good else "❌"} **{label}**: {state} {ch.mention}')
+        if not good:
+            roles=', '.join(d['roles']) if d['roles'] else 'inherit'
+            lines.append(f'↳ `@everyone={d["everyone"]} | roles={roles} | membro={d["member"]} | admin={d["administrator"]}`')
+    lines.append('\nℹ️ Este diagnóstico usa `channel.permissions_for(membro)`: a permissão efetiva da conta real. Não altera nenhuma permissão.')
     await i.followup.send('\n'.join(lines),ephemeral=True)
 
 @bot.tree.command(name='operacoes',description='Mostra a fila operacional pendente')
