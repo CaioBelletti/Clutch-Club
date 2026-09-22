@@ -6,6 +6,9 @@ from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 import os
 
+print(f"[BOOT DEBUG] clutch_bot.main = {os.path.abspath(__file__)}")
+print("[VERSION] CLUTCH OS V3.8.4.2 — BUYLIST 403 HOTFIX")
+
 def utc_aware(dt):
     """Normalize SQLite/SQLAlchemy datetimes to timezone-aware UTC."""
     if dt is None:
