@@ -298,7 +298,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.7 — RESERVATION RECOVERY + SKIN DELETE')
+    print('[VERSION] CLUTCH OS V3.8.4.8 — RESERVED ADMIN + TIMEOUT DIAGNOSTICS')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -1353,6 +1353,11 @@ class SkinDeleteConfirmView(discord.ui.View):
 class SkinPurchaseView(discord.ui.View):
     def __init__(self, skin=None):
         super().__init__(timeout=None)
+        # RESERVED keeps Staff edit + inspect visible, but removes COMPRAR from the public card.
+        if skin is not None and getattr(skin,'status',None) != 'AVAILABLE':
+            for child in list(self.children):
+                if getattr(child,'custom_id',None) == 'v370:skin:buy':
+                    self.remove_item(child)
         # Discord link buttons require http/https. The public Clutch route then opens steam://.
         if skin is not None and getattr(skin,'inspect',None):
             base=public_base_url()
@@ -1613,7 +1618,7 @@ async def refresh_skin(skin_id):
     with Session() as s:x=s.get(Skin,skin_id)
     if not x or not x.channel_id or not x.message_id:return
     ch=bot.get_channel(x.channel_id)
-    try:m=await ch.fetch_message(x.message_id);await m.edit(embed=skin_embed(x),view=SkinPurchaseView(x) if x.status=='AVAILABLE' else None)
+    try:m=await ch.fetch_message(x.message_id);await m.edit(embed=skin_embed(x),view=SkinPurchaseView(x) if x.status in ('AVAILABLE','RESERVED') else None)
     except:pass
 
 async def post_news(x,source_text='Nova skin disponível'):
@@ -1643,8 +1648,11 @@ async def process_expired_sale_reservations():
     candidates=[]
     with Session() as s:
         skins=list(s.scalars(select(Skin).where(Skin.status=='RESERVED')).all())
+        if skins:
+            print(f'[RESERVATION SCAN] {len(skins)} skin(s) RESERVED encontrada(s).')
         for skin in skins:
             sale=s.scalar(select(Sale).where(Sale.skin_id==skin.id).order_by(Sale.id.desc()))
+            print(f'[RESERVATION SCAN] {skin.code} | skin_until={skin.reserved_until} | sale={getattr(sale,"code",None)} | sale_status={getattr(sale,"status",None)} | sale_until={getattr(sale,"reserved_until",None)}')
             # Never auto-release a transaction that reached a protected payment/trade stage.
             if sale and sale.status in ('PAYMENT_CONFIRMED','TRADE_SENT','COMPLETED'):
                 continue
@@ -1652,12 +1660,14 @@ async def process_expired_sale_reservations():
                 candidates.append((skin.guild_id,skin.id,sale.code,'REPAIR_CANCELLED'))
                 continue
             if sale and sale.status=='RESERVED':
-                deadline=utc_aware(sale.reserved_until) or utc_aware(skin.reserved_until) or (utc_aware(sale.created_at)+timedelta(minutes=RESERVATION_MINUTES))
+                deadlines=[d for d in (utc_aware(sale.reserved_until),utc_aware(skin.reserved_until),(utc_aware(sale.created_at)+timedelta(minutes=RESERVATION_MINUTES)) if sale.created_at else None) if d]
+                deadline=min(deadlines) if deadlines else None
                 if deadline and deadline<now:candidates.append((skin.guild_id,skin.id,sale.code,'EXPIRED'))
                 continue
-            # Orphan RESERVED skin: no active sale. Use the skin deadline; created_at is a legacy last resort.
-            deadline=utc_aware(skin.reserved_until) or (utc_aware(skin.created_at)+timedelta(minutes=RESERVATION_MINUTES))
-            if deadline and deadline<now:candidates.append((skin.guild_id,skin.id,None,'ORPHAN'))
+            # Legacy/orphan RESERVED skin: any non-protected sale state must not keep stock locked forever.
+            deadlines=[d for d in (utc_aware(skin.reserved_until),(utc_aware(sale.reserved_until) if sale else None),((utc_aware(sale.created_at)+timedelta(minutes=RESERVATION_MINUTES)) if sale and sale.created_at else None),(utc_aware(skin.created_at)+timedelta(minutes=RESERVATION_MINUTES)) if skin.created_at else None) if d]
+            deadline=min(deadlines) if deadlines else None
+            if deadline and deadline<now:candidates.append((skin.guild_id,skin.id,getattr(sale,'code',None),'LEGACY_ORPHAN'))
     released=0
     for guild_id,skin_id,sale_code,reason in candidates:
         try:
