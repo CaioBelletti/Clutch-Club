@@ -298,7 +298,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.6 — RESERVATION TIMEOUT')
+    print('[VERSION] CLUTCH OS V3.8.4.7 — RESERVATION RECOVERY + SKIN DELETE')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -1303,6 +1303,52 @@ class SkinEditMenuView(discord.ui.View):
         x=self.get_skin();
         if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
         await i.response.send_modal(SkinEditMediaModal(x))
+    @discord.ui.button(label='EXCLUIR SKIN',emoji='🗑️',style=discord.ButtonStyle.danger)
+    async def delete_skin(self,i,b):
+        if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode excluir skins.',ephemeral=True)
+        x=self.get_skin()
+        if not x:return await i.response.send_message('❌ Skin não encontrada.',ephemeral=True)
+        if x.status in ('SOLD','PERSONAL','TEST_ARCHIVED','DELETED'):
+            return await i.response.send_message(f'❌ {x.code} não pode ser excluída no status {x.status}.',ephemeral=True)
+        await i.response.send_message(f'⚠️ **Excluir {x.code} • {x.name}?**\nO anúncio será removido e a skin sairá do estoque. Histórico financeiro/operações existentes será preservado.\n\nEsta ação exige confirmação.',view=SkinDeleteConfirmView(x.id),ephemeral=True)
+
+class SkinDeleteConfirmView(discord.ui.View):
+    def __init__(self,skin_id:int):super().__init__(timeout=90);self.skin_id=skin_id
+    @discord.ui.button(label='CANCELAR',emoji='↩️',style=discord.ButtonStyle.secondary)
+    async def cancel(self,i,b):
+        await i.response.edit_message(content='↩️ Exclusão cancelada. Nenhuma alteração foi feita.',view=None)
+    @discord.ui.button(label='CONFIRMAR EXCLUSÃO',emoji='🗑️',style=discord.ButtonStyle.danger)
+    async def confirm(self,i,b):
+        if not staff(i.user):return await i.response.send_message('❌ Apenas Staff/Fundador pode excluir skins.',ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        old_code=None; channel_id=None; message_id=None; cancelled_sale=None
+        with Session.begin() as s:
+            x=s.get(Skin,self.skin_id)
+            if not x:return await i.followup.send('❌ Skin não encontrada.',ephemeral=True)
+            if x.status in ('SOLD','PERSONAL','TEST_ARCHIVED','DELETED'):
+                return await i.followup.send(f'❌ {x.code} não pode ser excluída no status {x.status}.',ephemeral=True)
+            sale=s.scalar(select(Sale).where(Sale.skin_id==x.id).order_by(Sale.id.desc()))
+            if sale and sale.status in ('PAYMENT_CONFIRMED','TRADE_SENT','COMPLETED'):
+                return await i.followup.send(f'🔒 Não é possível excluir {x.code}: {sale.code} está em {sale.status}. Finalize/cancele corretamente a negociação.',ephemeral=True)
+            if sale and sale.status=='RESERVED':
+                sale.status='CANCELLED'; cancelled_sale=sale.code
+                log(s,x.guild_id,i.user.id,'SALE_STATUS','sale',sale.id,'RESERVED->CANCELLED; skin deleted by staff')
+            old_code=x.code;channel_id=x.channel_id;message_id=x.message_id
+            x.code=f'DEL-{x.id:05d}';x.status='DELETED';x.reserved_by=None;x.reserved_until=None;x.channel_id=None;x.message_id=None
+            log(s,x.guild_id,i.user.id,'SKIN_DELETE','skin',x.id,f'{old_code}->DELETED; history preserved')
+        if channel_id and message_id:
+            ch=bot.get_channel(int(channel_id))
+            if isinstance(ch,discord.TextChannel):
+                try:
+                    msg=await ch.fetch_message(int(message_id));await msg.delete()
+                except discord.NotFound:pass
+                except Exception as e:print(f'[SKIN DELETE] {old_code} anúncio: {type(e).__name__}: {e}')
+        if cancelled_sale:
+            await refresh_sale_operation(cancelled_sale,gid(i))
+            await ticket_notice(gid(i),cancelled_sale,f'🗑️ **{old_code} removida do estoque pela equipe.** A reserva foi cancelada sem lançamento financeiro.')
+            await close_negotiation_ticket(gid(i),cancelled_sale,'Reserva cancelada — skin removida do estoque')
+        print(f'[SKIN DELETE] {old_code} -> DELETED | código público liberado para reutilização')
+        await i.followup.send(f'✅ **{old_code} excluída do estoque e do catálogo.** O histórico foi preservado e o código público poderá ser reutilizado.',ephemeral=True)
 
 class SkinPurchaseView(discord.ui.View):
     def __init__(self, skin=None):
@@ -1592,28 +1638,49 @@ async def invite_feedback(sale):
     except:pass
 
 async def process_expired_sale_reservations():
-    """Cancel only unpaid RESERVED sales whose deadline passed, then repair Discord state."""
+    """Repair expired/orphan RESERVED skins, including reservations created before V3.8.4.6."""
     now=datetime.now(timezone.utc)
+    candidates=[]
     with Session() as s:
-        expired=[(x.guild_id,x.code,x.skin_id) for x in s.scalars(select(Sale).where(Sale.status=='RESERVED',Sale.reserved_until.is_not(None),Sale.reserved_until<now)).all()]
+        skins=list(s.scalars(select(Skin).where(Skin.status=='RESERVED')).all())
+        for skin in skins:
+            sale=s.scalar(select(Sale).where(Sale.skin_id==skin.id).order_by(Sale.id.desc()))
+            # Never auto-release a transaction that reached a protected payment/trade stage.
+            if sale and sale.status in ('PAYMENT_CONFIRMED','TRADE_SENT','COMPLETED'):
+                continue
+            if sale and sale.status=='CANCELLED':
+                candidates.append((skin.guild_id,skin.id,sale.code,'REPAIR_CANCELLED'))
+                continue
+            if sale and sale.status=='RESERVED':
+                deadline=utc_aware(sale.reserved_until) or utc_aware(skin.reserved_until) or (utc_aware(sale.created_at)+timedelta(minutes=RESERVATION_MINUTES))
+                if deadline and deadline<now:candidates.append((skin.guild_id,skin.id,sale.code,'EXPIRED'))
+                continue
+            # Orphan RESERVED skin: no active sale. Use the skin deadline; created_at is a legacy last resort.
+            deadline=utc_aware(skin.reserved_until) or (utc_aware(skin.created_at)+timedelta(minutes=RESERVATION_MINUTES))
+            if deadline and deadline<now:candidates.append((skin.guild_id,skin.id,None,'ORPHAN'))
     released=0
-    for guild_id,code,skin_id in expired:
+    for guild_id,skin_id,sale_code,reason in candidates:
         try:
-            sale,skin=sale_step(guild_id,0,code,'CANCELLED')
-        except ValueError:
-            # Another worker/staff may have advanced the sale after the SELECT.
-            continue
-        except Exception as e:
-            print(f'[RESERVATION TIMEOUT] {code} falhou: {type(e).__name__}: {e}')
-            continue
-        try:
+            if sale_code and reason=='EXPIRED':
+                sale,skin=sale_step(guild_id,0,sale_code,'CANCELLED')
+            else:
+                with Session.begin() as s:
+                    skin=s.get(Skin,skin_id)
+                    if not skin or skin.status!='RESERVED':continue
+                    skin.status='AVAILABLE';skin.reserved_by=None;skin.reserved_until=None
+                    log(s,guild_id,0,'RESERVATION_RECOVERY','skin',skin.id,f'{reason}; sale={sale_code or "none"}')
+                    skin_code=skin.code
+                with Session() as s:skin=s.get(Skin,skin_id)
+                sale=None
             await refresh_skin(skin.id)
-            await refresh_sale_operation(sale.code,guild_id)
-            await ticket_notice(guild_id,sale.code,'⏱️ **Reserva expirada automaticamente.** O prazo terminou sem confirmação de pagamento e a skin voltou a ficar disponível no catálogo.')
+            if sale_code:
+                await refresh_sale_operation(sale_code,guild_id)
+                await ticket_notice(guild_id,sale_code,'⏱️ **Reserva expirada automaticamente.** O prazo terminou sem confirmação de pagamento e a skin voltou a ficar disponível no catálogo.')
+                await close_negotiation_ticket(guild_id,sale_code,'Reserva expirada automaticamente')
             released+=1
-            print(f'[RESERVATION TIMEOUT] {sale.code} expirou | {skin.code} -> AVAILABLE | sem lançamento financeiro')
+            print(f'[RESERVATION TIMEOUT] {sale_code or "sem VD"} | {skin.code} -> AVAILABLE | motivo={reason} | sem lançamento financeiro')
         except Exception as e:
-            print(f'[RESERVATION TIMEOUT] {sale.code} DB liberado, mas sincronização Discord falhou: {type(e).__name__}: {e}')
+            print(f'[RESERVATION TIMEOUT] {sale_code or skin_id} falhou: {type(e).__name__}: {e}')
     return released
 
 @tasks.loop(minutes=1)

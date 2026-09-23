@@ -17,14 +17,20 @@ def set_cfg(g,key,value):
     with Session.begin() as s:s.merge(GuildConfig(guild_id=g,key=key,value=str(value)))
 
 def next_skin_code(s, guild):
-    """Return the next sequential public SK code, independent from the DB primary key."""
+    """Return the lowest free sequential public SK code.
+
+    Archived/deleted/test codes do not reserve a public number, so a test skin can be
+    removed and its number safely reused without depending on the DB primary key.
+    """
     rows=s.scalars(select(Skin.code).where(Skin.guild_id==guild, Skin.code.like('SK-%'))).all()
-    nums=[]
+    used=set()
     for code in rows:
         try:
-            if code and code.startswith('SK-') and code[3:].isdigit(): nums.append(int(code[3:]))
+            if code and code.startswith('SK-') and code[3:].isdigit(): used.add(int(code[3:]))
         except Exception: pass
-    return f'SK-{(max(nums) if nums else 0)+1:05d}'
+    n=1
+    while n in used:n+=1
+    return f'SK-{n:05d}'
 
 def create_skin(guild,name,exterior,floatv,pattern,stickers,price,cost=0,inspect=None,source='MANUAL',source_ref=None,fees=0):
     if not valid_float(floatv):raise ValueError('Float deve estar entre 0 e 1.')
