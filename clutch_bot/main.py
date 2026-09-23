@@ -62,6 +62,9 @@ def find_order_by_code(code, requested_guild=0):
         if not o: print(f'[ORDER RESOLVE] NOT FOUND code={code} requested_guild={requested_guild} canonical_guild={cg}')
         return o
 def money(v):return 'R$ '+f'{D(v):,.2f}'.replace(',','X').replace('.',',').replace('X','.')
+def reservation_display(dt):
+    dt=utc_aware(dt)
+    return dt.astimezone(CLUTCH_TZ).strftime('%d/%m/%Y %H:%M') if dt else '—'
 def staff(m):return m.guild_permissions.manage_guild or (STAFF_ROLE_ID and any(r.id==STAFF_ROLE_ID for r in m.roles))
 def channel(g,key):
     x=cfg(g,key+'_channel_id');return bot.get_channel(int(x)) if x else None
@@ -295,7 +298,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.5 — INTERACTION STABILITY')
+    print('[VERSION] CLUTCH OS V3.8.4.6 — RESERVATION TIMEOUT')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -435,7 +438,7 @@ class ReserveModal(discord.ui.Modal,title='Comprar / reservar skin'):
     async def on_submit(self,i):
         try:sale,x=reserve(gid(i),i.user.id,self.code.value,RESERVATION_MINUTES)
         except Exception as e:return await i.response.send_message(f'❌ {e}',ephemeral=True)
-        await refresh_skin(x.id);opid=queue_operation(gid(i),'SALE',sale.code,sale.id,i.user.id,f'RESERVA / VENDA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\nReserva por {RESERVATION_MINUTES} minutos.','HIGH');await publish_operation(opid);await i.response.send_message(f'🔒 **{x.code}** reservada por {RESERVATION_MINUTES} min. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. A equipe já foi notificada.',ephemeral=True)
+        await refresh_skin(x.id);expires=reservation_display(sale.reserved_until);opid=queue_operation(gid(i),'SALE',sale.code,sale.id,i.user.id,f'RESERVA / VENDA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\n**Reserva expira:** {expires}\n\n⏱️ Se o pagamento não for confirmado até esse horário, a reserva será cancelada automaticamente.','HIGH');await publish_operation(opid);await i.response.send_message(f'🔒 **{x.code}** reservada até **{expires}**. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. A equipe já foi notificada.',ephemeral=True)
 
 class InterestModal(discord.ui.Modal,title='Lista de interesse'):
     skin=discord.ui.TextInput(label='Skin procurada');exterior=discord.ui.TextInput(label='Exterior',required=False);budget=discord.ui.TextInput(label='Orçamento máximo',required=False);maxfloat=discord.ui.TextInput(label='Float máximo',required=False)
@@ -935,7 +938,7 @@ async def refresh_sale_operation(code:str,guild_id:int):
         skin=s.get(Skin,sale.skin_id)
         label={'RESERVED':'PAGAMENTO PENDENTE','PAYMENT_CONFIRMED':'PAGAMENTO CONFIRMADO','TRADE_SENT':'TRADE ENVIADA','COMPLETED':'CONCLUÍDA','CANCELLED':'CANCELADA'}.get(sale.status,sale.status)
         op.title=f'RESERVA / VENDA — {sale.code}'
-        op.detail=f'**Skin:** {skin.code if skin else "—"} • {skin.name if skin else "—"}\n**Valor:** {money(sale.sale_price)}\n**Etapa:** {label}'
+        op.detail=f'**Skin:** {skin.code if skin else "—"} • {skin.name if skin else "—"}\n**Valor:** {money(sale.sale_price)}\n**Etapa:** {label}' + (f'\n**Reserva expira:** {reservation_display(sale.reserved_until)}' if sale.status=='RESERVED' else '')
         op.status='DONE' if sale.status=='COMPLETED' else ('CANCELLED' if sale.status=='CANCELLED' else 'ACTION_REQUIRED')
         oid=op.id;mid=op.staff_message_id;cid=op.staff_channel_id
     await ticket_notice(guild_id,code,f'📌 **{code} — {label}**')
@@ -1325,10 +1328,11 @@ class SkinPurchaseView(discord.ui.View):
         try:sale,x=reserve(gid(i),i.user.id,code,RESERVATION_MINUTES)
         except Exception as e:return await i.response.send_message(f'❌ {e}',ephemeral=True)
         await refresh_skin(x.id)
-        opid=queue_operation(gid(i),'SALE',sale.code,sale.id,i.user.id,f'RESERVA / VENDA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\nReserva por {RESERVATION_MINUTES} minutos.','HIGH')
+        expires=reservation_display(sale.reserved_until)
+        opid=queue_operation(gid(i),'SALE',sale.code,sale.id,i.user.id,f'RESERVA / VENDA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\n**Reserva expira:** {expires}\n\n⏱️ Se o pagamento não for confirmado até esse horário, a reserva será cancelada automaticamente.','HIGH')
         await publish_operation(opid)
-        await ensure_negotiation_ticket(gid(i),i.user.id,sale.code,'SALE',f'🛒 COMPRA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\n**Reserva:** {RESERVATION_MINUTES} minutos\n\nA equipe continuará o pagamento e a entrega por este ticket.')
-        await i.response.send_message(f'🔒 **{x.code}** reservada por {RESERVATION_MINUTES} min. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. Seu ticket privado foi aberto.',ephemeral=True)
+        await ensure_negotiation_ticket(gid(i),i.user.id,sale.code,'SALE',f'🛒 COMPRA — {sale.code}',f'**Skin:** {x.code} • {x.name}\n**Valor:** {money(sale.sale_price)}\n**Reserva válida até:** {expires}\n\n⏱️ Finalize o pagamento dentro desse prazo. Após a confirmação do pagamento pela equipe, a expiração automática é interrompida.')
+        await i.response.send_message(f'🔒 **{x.code}** reservada até **{expires}**. Pedido **{sale.code}**, valor **{money(sale.sale_price)}**. Seu ticket privado foi aberto.',ephemeral=True)
 
 class PublicPanel(discord.ui.View):
     def __init__(self):super().__init__(timeout=None)
@@ -1587,8 +1591,35 @@ async def invite_feedback(sale):
         await u.send(f'⭐ Sua compra **{sale.code}** foi concluída. Se quiser, avalie sua experiência com a Clutch Club.',view=VerifiedFeedbackView(sale.code))
     except:pass
 
+async def process_expired_sale_reservations():
+    """Cancel only unpaid RESERVED sales whose deadline passed, then repair Discord state."""
+    now=datetime.now(timezone.utc)
+    with Session() as s:
+        expired=[(x.guild_id,x.code,x.skin_id) for x in s.scalars(select(Sale).where(Sale.status=='RESERVED',Sale.reserved_until.is_not(None),Sale.reserved_until<now)).all()]
+    released=0
+    for guild_id,code,skin_id in expired:
+        try:
+            sale,skin=sale_step(guild_id,0,code,'CANCELLED')
+        except ValueError:
+            # Another worker/staff may have advanced the sale after the SELECT.
+            continue
+        except Exception as e:
+            print(f'[RESERVATION TIMEOUT] {code} falhou: {type(e).__name__}: {e}')
+            continue
+        try:
+            await refresh_skin(skin.id)
+            await refresh_sale_operation(sale.code,guild_id)
+            await ticket_notice(guild_id,sale.code,'⏱️ **Reserva expirada automaticamente.** O prazo terminou sem confirmação de pagamento e a skin voltou a ficar disponível no catálogo.')
+            released+=1
+            print(f'[RESERVATION TIMEOUT] {sale.code} expirou | {skin.code} -> AVAILABLE | sem lançamento financeiro')
+        except Exception as e:
+            print(f'[RESERVATION TIMEOUT] {sale.code} DB liberado, mas sincronização Discord falhou: {type(e).__name__}: {e}')
+    return released
+
 @tasks.loop(minutes=1)
-async def housekeeping():expire_reservations()
+async def housekeeping():
+    await process_expired_sale_reservations()
+
 _startup_done=False
 @bot.event
 async def on_member_join(member:discord.Member):
@@ -1629,6 +1660,10 @@ async def on_ready():
             print(f'[CATALOG] Aviso ao sincronizar botões de compra: {type(e).__name__}: {e}')
         if not housekeeping.is_running():
             housekeeping.start()
+        # V3.8.4.6: recover reservations that expired while the bot was offline/redeploying.
+        recovered=await process_expired_sale_reservations()
+        if recovered:
+            print(f'[RESERVATION TIMEOUT] recovery no boot: {recovered} reserva(s) vencida(s) liberada(s).')
         # V3.4.4.1: Discord Bootstrap Shield. Never let command sync abort on_ready.
         connected_ids=[g.id for g in bot.guilds]
         print(f'[DISCORD] Guilds conectadas: {connected_ids}')
