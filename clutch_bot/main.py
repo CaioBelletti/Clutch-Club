@@ -298,7 +298,7 @@ async def apply_buylist_mode(guild_id:int):
     requires Manage Channels/Manage Roles and cannot fail with 403 Missing Permissions.
     History/data are never deleted.
     """
-    print('[VERSION] CLUTCH OS V3.8.4.8 — RESERVED ADMIN + TIMEOUT DIAGNOSTICS')
+    print('[VERSION] CLUTCH OS V3.8.4.9 — RESERVED RECOVERY FIX')
     guild=bot.get_guild(int(guild_id)); ch=channel(guild_id,'buylist')
     if not guild or not isinstance(ch,discord.TextChannel):
         print('[BUYLIST MODE] canal buylist não encontrado; modo lógico preservado.')
@@ -1621,6 +1621,45 @@ async def refresh_skin(skin_id):
     try:m=await ch.fetch_message(x.message_id);await m.edit(embed=skin_embed(x),view=SkinPurchaseView(x) if x.status in ('AVAILABLE','RESERVED') else None)
     except:pass
 
+async def reconcile_active_skin_messages(guild_id:int):
+    """V3.8.4.9: GET active catalog cards and PATCH only stale/mismatched ones."""
+    checked=patched=missing=failed=0
+    with Session() as s:
+        rows=list(s.scalars(select(Skin).where(Skin.guild_id==guild_id,Skin.status.in_(['AVAILABLE','RESERVED']))).all())
+        items=[(x.id,x.code,x.status,x.channel_id,x.message_id) for x in rows if x.channel_id and x.message_id]
+    for skin_id,code,status,channel_id,message_id in items:
+        checked+=1
+        ch=bot.get_channel(int(channel_id))
+        if not isinstance(ch,discord.TextChannel):
+            failed+=1;continue
+        try:
+            msg=await ch.fetch_message(int(message_id))
+            custom_ids=set()
+            for row in getattr(msg,'components',[]) or []:
+                for item in getattr(row,'children',[]) or []:
+                    cid=getattr(item,'custom_id',None)
+                    if cid:custom_ids.add(cid)
+            has_edit='v384:skin:edit' in custom_ids
+            has_buy='v370:skin:buy' in custom_ids
+            expected_buy=(status=='AVAILABLE')
+            embed_text=' '.join(str(e.to_dict()) for e in (getattr(msg,'embeds',[]) or []))
+            status_ok=(code in embed_text and status in embed_text)
+            stale=(not has_edit) or (has_buy != expected_buy) or (not status_ok)
+            if stale:
+                with Session() as s:x=s.get(Skin,skin_id)
+                if x:
+                    await msg.edit(embed=skin_embed(x),view=SkinPurchaseView(x))
+                    patched+=1
+                    print(f'[RESERVED RECONCILE] {code} | status={status} | anúncio atualizado')
+        except discord.NotFound:
+            missing+=1
+            print(f'[RESERVED RECONCILE] {code} | mensagem ausente (404)')
+        except Exception as e:
+            failed+=1
+            print(f'[RESERVED RECONCILE] {code} | falha: {type(e).__name__}: {e}')
+    print(f'[RESERVED RECONCILE] checked={checked} | patched={patched} | ausentes={missing} | falhas={failed}')
+    return patched
+
 async def post_news(x,source_text='Nova skin disponível'):
     ch=channel(x.guild_id,'news')
     if not isinstance(ch,discord.TextChannel):return
@@ -1648,8 +1687,7 @@ async def process_expired_sale_reservations():
     candidates=[]
     with Session() as s:
         skins=list(s.scalars(select(Skin).where(Skin.status=='RESERVED')).all())
-        if skins:
-            print(f'[RESERVATION SCAN] {len(skins)} skin(s) RESERVED encontrada(s).')
+        print(f'[RESERVATION SCAN] {len(skins)} skin(s) RESERVED encontrada(s).')
         for skin in skins:
             sale=s.scalar(select(Sale).where(Sale.skin_id==skin.id).order_by(Sale.id.desc()))
             print(f'[RESERVATION SCAN] {skin.code} | skin_until={skin.reserved_until} | sale={getattr(sale,"code",None)} | sale_status={getattr(sale,"status",None)} | sale_until={getattr(sale,"reserved_until",None)}')
@@ -1741,6 +1779,9 @@ async def on_ready():
         recovered=await process_expired_sale_reservations()
         if recovered:
             print(f'[RESERVATION TIMEOUT] recovery no boot: {recovered} reserva(s) vencida(s) liberada(s).')
+        # V3.8.4.9: reconcile only stale active catalog messages. This repairs legacy RESERVED cards
+        # without restoring the old mass-PATCH behavior.
+        await reconcile_active_skin_messages(int(GUILD_ID) if GUILD_ID else (bot.guilds[0].id if bot.guilds else 0))
         # V3.4.4.1: Discord Bootstrap Shield. Never let command sync abort on_ready.
         connected_ids=[g.id for g in bot.guilds]
         print(f'[DISCORD] Guilds conectadas: {connected_ids}')
